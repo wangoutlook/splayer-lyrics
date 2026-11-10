@@ -59,8 +59,12 @@ pub enum UiMsg {
     ToggleVisible,
     SetFontSize(i32),
     SetFontFamily(String),
+    SetWidthMode(String),
     SetColor(String),
     FollowSystemColor,
+    SetLyricOffset(f64),
+    ToggleTranslation,
+    ToggleRomanization,
     SetOutput(String),
     Quit,
 }
@@ -99,8 +103,7 @@ fn fetch_lyrics(agent: &Agent, base_url: &str, track_id: &str) -> Result<LyricsD
     let body = response
         .into_string()
         .map_err(|e| format!("read lyrics body: {e}"))?;
-    let (resp_track, lines, offset) =
-        model::parse_lyrics(&body).map_err(|e| format!("{e:#}"))?;
+    let (resp_track, lines, offset) = model::parse_lyrics(&body).map_err(|e| format!("{e:#}"))?;
     if let Some(resp_id) = &resp_track {
         if resp_id != track_id {
             logging::debug(&format!(
@@ -115,9 +118,8 @@ fn fetch_lyrics(agent: &Agent, base_url: &str, track_id: &str) -> Result<LyricsD
     })
 }
 
-fn post_control(base_url: String, action: ControlAction, tx: Sender<UiMsg>) {
+fn post_control(agent: Agent, base_url: String, action: ControlAction, tx: Sender<UiMsg>) {
     thread::spawn(move || {
-        let agent = agent();
         let url = format!("{base_url}{}", action.endpoint());
         let result = agent.post(&url).send_string("");
         match result {
@@ -179,7 +181,7 @@ pub fn spawn(base_url: String, poll_ms: u64, tx: Sender<UiMsg>) -> Sender<Comman
                     next_poll = Instant::now();
                 }
                 Ok(Command::Control(action)) => {
-                    post_control(base_url.clone(), action, tx.clone());
+                    post_control(agent.clone(), base_url.clone(), action, tx.clone());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,

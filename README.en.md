@@ -3,7 +3,7 @@
 [简体中文](README.md) | **English**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 [![Platform](https://img.shields.io/badge/platform-Wayland%20%7C%20niri-blue)](https://github.com/YaLTeR/niri)
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 
@@ -44,8 +44,14 @@ Repository: <https://github.com/wangoutlook/splayer-lyrics>
   unreachable, the card, shadow and controls are not drawn at all and the
   surface has an empty input region.
 - **Draggable**: drag the controls or the six-dot handle; the position is saved.
-- **Tray menu** (StatusNotifierItem): font size, font family, color preset,
-  monitor selection, show/hide and quit.
+  A control click fires only on release when the drag threshold was not
+  crossed, so dragging a control never toggles playback.
+- **Configurable width growth**: when a lyric line gets longer or shorter, the
+  card can grow symmetrically, to the left (right edge fixed) or to the right
+  (left edge fixed). Switchable from the tray.
+- **Tray menu** (StatusNotifierItem): font size, font family, width growth,
+  translation/romanization toggles, lyric offset, color preset, monitor
+  selection, show/hide and quit.
 - **Hide button** at the card's bottom-left.
 - **Theme accent sync**: can read the current niri / Waybar accent color and
   follow it every 5 seconds.
@@ -142,6 +148,19 @@ You can also run the binary directly:
 - Only the card coordinates change; the full-output surface itself never moves,
   so dragging stays 1:1 with the pointer.
 
+### Width growth direction
+
+When a lyric line gets wider or narrower, the anchor is controlled by
+`width_mode` (or the tray's “宽度变化” submenu):
+
+- `center` (default): the center stays fixed; the card grows/shrinks both ways;
+- `left`: the right edge stays fixed; the card grows towards the left;
+- `right`: the left edge stays fixed; the card grows towards the right.
+
+The setting applies on the next lyric-line width change; switching it does not
+jump the card. `runtime/position.json` stores both the center and the width, so
+the last layout is restored after a restart.
+
 ### Hide
 
 - The `⌄` button at the card's bottom-left hides the whole card and clears the
@@ -154,23 +173,40 @@ You can also run the binary directly:
 | Item | Action |
 |---|---|
 | 显示/隐藏歌词 | Toggle the whole card |
+| 显示翻译 / 显示罗马音 | Toggle the translation / romanization line |
 | 字号 | 28 / 32 / 36 / 40 px |
 | 字体 | Noto Sans + CJK, Noto Sans CJK, LXGW WenKai Screen, Noto Serif CJK |
-| 显示器 | HDMI-A-1 / eDP-1 |
+| 宽度变化 | Symmetric (center), grow left (right edge fixed), grow right (left edge fixed) |
+| 歌词偏移 | Nudge the current offset by -100 / -50 / +50 / +100 ms, or reset to 0 (range ±30 s) |
+| 显示器 | Current GDK monitors; refreshed after an automatic hotplug restart |
 | 配色 | Follow system accent, SPlayer pink, white, blue, green |
 | 退出 | Quit the overlay |
 
-Font size, family, color and visibility are stored in `runtime/ui.json` and take
-precedence over `config.json`. The tray is a StatusNotifierItem, so Waybar's
-`tray` module must be enabled.
+Font size, family, color, visibility, width mode, translation/romanization
+toggles and lyric offset are stored in `runtime/ui.json` and take precedence
+over `config.json`. The tray is a StatusNotifierItem, so Waybar's `tray` module
+must be enabled.
 
 ### Monitor selection
 
-- The tray rewrites `output` in `config.json` and restarts the overlay through
-  `start.sh` (about one second of flicker).
-- It moves the card to the selected output. It does **not** drag across outputs;
-  a layer-shell surface is bound to a single output.
-- If the card ends up partly off-screen after switching, drag it back.
+On startup the overlay picks an output in this order:
+
+1. `last_output` in `runtime/ui.json` (the screen it was last placed on);
+2. if that screen is gone, `output` in `config.json` (the first-run seed);
+3. otherwise the connected monitor with the highest resolution; the earliest
+   entry wins ties.
+
+Set `output` in `config.json` to `auto` to skip step 2 (`last_output` still wins).
+
+Plugging or unplugging a monitor, or changing a resolution, waits 350 ms for the
+layout to settle, saves the position and restarts the overlay (about one second
+of flicker). The restart runs the selection above again, and the new monitor
+appears in the tray menu. Choosing a monitor from the tray rewrites `output` in
+`config.json`, records the choice in `ui.json`, and restarts.
+
+The card is placed on the selected output only. It does **not** drag across
+outputs because a layer-shell surface is bound to a single output. Drag the card
+back if it ends up partly off-screen.
 
 ### Theme accent
 
@@ -221,6 +257,7 @@ All keys in `config.json` are optional; missing keys use these defaults:
 {
   "api": {"host": "127.0.0.1", "port": 14558, "poll_ms": 900},
   "output": "HDMI-A-1",
+  "width_mode": "center",
   "width": 1800,
   "height": 200,
   "bottom_margin": 96,
@@ -261,7 +298,8 @@ All keys in `config.json` are optional; missing keys use these defaults:
 |---|---|---|
 | `api.host` / `api.port` | `127.0.0.1` / `14558` | SPlayer-Next API address |
 | `api.poll_ms` | `900` | Poll interval in milliseconds |
-| `output` | `HDMI-A-1` | Monitor connector matched against `Gdk.Monitor.connector()` |
+| `output` | `HDMI-A-1` | First-run monitor seed; afterwards `last_output` in `runtime/ui.json` wins, then the highest-resolution screen |
+| `width_mode` | `center` | Width growth: `center` symmetric, `left` right edge fixed, `right` left edge fixed |
 | `width` | `1800` | Fallback card width; the real width is measured per line |
 | `height` | `200` | Fixed card height |
 | `bottom_margin` | `96` | Default distance from the bottom when no position file exists |
@@ -284,7 +322,7 @@ All keys in `config.json` are optional; missing keys use these defaults:
 | `background.color` | `#000000` | Shadow color |
 | `background.alpha` | `0.22` | Shadow opacity |
 | `background.radius` | `14` | Corner radius |
-| `background.padding_x` / `padding_y` | `28` / `12` | Card padding |
+| `background.padding_x` / `padding_y` | `28` / `12` | Card padding; the horizontal value participates in width measurement, the vertical value pads the background |
 | `controls.enabled` | `true` | Show the bottom controls |
 | `controls.right_margin` | `48` | Handle distance from the card's right edge |
 | `controls.bottom_margin` | `24` | Controls distance from the card's bottom |
@@ -302,17 +340,18 @@ Notes:
 - `GSK_RENDERER=cairo` and `GTK_A11Y=none` matter; the GL renderer roughly
   doubles PSS.
 - Tray choices are stored in `runtime/ui.json`; after that, changing
-  font/size/color in `config.json` will not override them. Delete
-  `runtime/ui.json` to fall back to the config file.
+  font/size/color/width mode/translation toggles/lyric offset in `config.json`
+  will not override them. Delete `runtime/ui.json` to fall back to the config
+  file.
 
 ## Runtime files
 
 | File | Description |
 |---|---|
 | `runtime/pid` | Current process PID |
-| `runtime/run.log` | Append-only timestamped log |
-| `runtime/position.json` | Card horizontal center and bottom distance |
-| `runtime/ui.json` | Tray settings: visibility, font, size, color, follow-system |
+| `runtime/run.log` | Append-only timestamped log; `start.sh` rotates it to `run.log.1` at startup if above 5 MB |
+| `runtime/position.json` | Card center, width and bottom distance |
+| `runtime/ui.json` | Tray settings: visibility, font, size, color, follow-system, width mode, translation/romanization, lyric offset, last monitor |
 | `runtime/*.png` | Test screenshots (not used at runtime) |
 
 All of these are ignored by `.gitignore`.
@@ -331,9 +370,11 @@ flowchart LR
 
 - A worker thread polls `GET /api/now-playing` every `api.poll_ms` with 1.5 s
   timeouts.
-- Each poll re-anchors the clock with
-  `position + clamp(local_now_ms - sendTimestamp, 0, 5000) * speed`; between
-  polls the GTK main loop interpolates at `fps`.
+- Each poll computes
+  `position + clamp(local_now_ms - sendTimestamp, 0, 5000) * speed` as the
+  reported time and re-anchors only when it differs from the local prediction
+  by more than 120 ms; smaller differences keep the local clock to avoid
+  polling jitter. Between polls the GTK main loop interpolates at `fps`.
 - Lyrics are fetched when the track changes, or when `lyricAvailable` is true
   but no lines are loaded. Responses with a different `trackId` are dropped.
 - Without lyrics, the overlay shows the track title and artists; it switches to
@@ -358,7 +399,8 @@ flowchart LR
 - **2× supersampled text**: laid out and cached once per line, so CPU spikes
   only on line changes.
 - **One output at a time**: true cross-monitor drag needs per-output surfaces and
-  global coordinates, which is significantly more complex.
+  global coordinates, which is significantly more complex; hotplug and mode
+  changes are covered by an automatic restart.
 - **HTTP polling only**: no WebSocket/MPRIS dependency; also works against a
   remote host.
 
@@ -430,12 +472,14 @@ tail -50 runtime/run.log
 ```
 
 Common causes: missing `gtk4-layer-shell`, not running under Wayland, or a wrong
-monitor connector name.
+monitor connector name (the overlay falls back to the highest-resolution screen;
+look for `selected monitor` in `runtime/run.log`).
 
 ## Known limitations
 
 - One output at a time; the tray can switch monitors but the card cannot be
-  dragged across the screen boundary.
+  dragged across the screen boundary. Hotplug or a resolution change restarts
+  the overlay (about one second).
 - Wayland only; no X11, Windows or macOS build.
 - Only SPlayer-Next's HTTP API is supported.
 - The tray needs a StatusNotifierWatcher (Waybar); without it the app still runs
@@ -452,9 +496,11 @@ monitor connector name.
 - [x] Shared shadow, hide button, click-through lyrics
 - [x] StatusNotifierItem tray menu
 - [x] Font size / family / color / show-hide / quit
+- [x] Translation/romanization toggles and lyric offset in the tray
 - [x] Follow niri / Waybar accent color
-- [x] Monitor switch from the tray
+- [x] Monitor switch from the tray (enumerated dynamically)
 - [x] Draw nothing while the player is closed
+- [x] Configurable width growth (symmetric / left / right)
 - [ ] True cross-monitor dragging (one surface per output + global coordinates)
 - [ ] Custom hotkeys
 - [ ] systemd user service / a more generic autostart story

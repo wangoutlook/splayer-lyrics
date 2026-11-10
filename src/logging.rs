@@ -1,9 +1,9 @@
+use gtk4::glib;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use gtk4::glib;
 
 static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
 static DEBUG: AtomicBool = AtomicBool::new(false);

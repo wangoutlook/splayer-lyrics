@@ -17,6 +17,16 @@ if [[ ! -x target/release/splayer-lyrics ]]; then
     ./build.sh
 fi
 
+# Rotate before opening the append redirect below, so stderr and the app's
+# own log file always point at the same inode.
+LOGFILE="runtime/run.log"
+if [[ -f "$LOGFILE" ]]; then
+    size="$(stat -c%s "$LOGFILE" 2>/dev/null || echo 0)"
+    if (( size > 5 * 1024 * 1024 )); then
+        mv -f "$LOGFILE" "$LOGFILE.1"
+    fi
+fi
+
 export GDK_BACKEND=wayland
 export GSK_RENDERER="${SPLAYER_LYRICS_GSK_RENDERER:-cairo}"
 export GTK_A11Y=none

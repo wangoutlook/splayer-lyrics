@@ -2,11 +2,14 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+pub const LYRIC_OFFSET_LIMIT_MS: f64 = 30_000.0;
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub api: ApiConfig,
     pub output: String,
+    pub width_mode: WidthMode,
     pub width: i32,
     pub height: i32,
     pub bottom_margin: i32,
@@ -27,6 +30,43 @@ pub struct Config {
     pub hide_when_disconnected: bool,
     pub background: BackgroundConfig,
     pub controls: ControlsConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WidthMode {
+    #[default]
+    Center,
+    Left,
+    Right,
+}
+
+impl WidthMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "center" | "centre" | "symmetric" | "symmetrical" => Some(Self::Center),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Center => "center",
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for WidthMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(Self::parse(&value).unwrap_or_default())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +103,7 @@ impl Default for Config {
         Self {
             api: ApiConfig::default(),
             output: "HDMI-A-1".to_string(),
+            width_mode: WidthMode::Center,
             width: 1800,
             height: 200,
             bottom_margin: 96,
@@ -145,6 +186,9 @@ impl Config {
             2.0
         };
         self.fps = self.fps.clamp(1, 30);
+        self.lyric_offset_ms = self
+            .lyric_offset_ms
+            .clamp(-LYRIC_OFFSET_LIMIT_MS, LYRIC_OFFSET_LIMIT_MS);
         self.api.poll_ms = self.api.poll_ms.clamp(150, 60_000);
         self.background.alpha = self.background.alpha.clamp(0.0, 1.0);
         self.background.radius = self.background.radius.max(0);

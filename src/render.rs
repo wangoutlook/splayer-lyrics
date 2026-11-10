@@ -2,7 +2,9 @@ use crate::config::{BackgroundConfig, Config, ControlsConfig};
 use crate::model::{line_progress, line_text, word_progress, word_timing_usable, LyricLine};
 use cairo::Context;
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::f64::consts::PI;
+use std::hash::{Hash, Hasher};
 
 pub const CONTROLS_GAP: f64 = 6.0;
 
@@ -24,16 +26,15 @@ struct LyricGeometry {
 }
 
 struct CachedLyrics {
-    key: String,
+    key: u64,
     base: cairo::ImageSurface,
     played: cairo::ImageSurface,
     geometry: Option<LyricGeometry>,
 }
 
 thread_local! {
-    static CACHE: RefCell<Option<CachedLyrics>> = RefCell::new(None);
+    static CACHE: RefCell<Option<CachedLyrics>> = const { RefCell::new(None) };
 }
-
 
 pub fn parse_color(hex: &str) -> (f64, f64, f64) {
     let value = hex.trim().trim_start_matches('#');
@@ -57,11 +58,9 @@ pub fn parse_color(hex: &str) -> (f64, f64, f64) {
             let g = value.get(2..4).and_then(parse);
             let b = value.get(4..6).and_then(parse);
             match (r, g, b) {
-                (Some(r), Some(g), Some(b)) => (
-                    r as f64 / 255.0,
-                    g as f64 / 255.0,
-                    b as f64 / 255.0,
-                ),
+                (Some(r), Some(g), Some(b)) => {
+                    (r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0)
+                }
                 _ => (1.0, 1.0, 1.0),
             }
         }
@@ -83,7 +82,12 @@ pub fn clear_rect(cr: &Context, x: i32, y: i32, width: i32, height: i32) {
         return;
     }
     let _ = cr.save();
-    cr.rectangle(f64::from(x), f64::from(y), f64::from(width), f64::from(height));
+    cr.rectangle(
+        f64::from(x),
+        f64::from(y),
+        f64::from(width),
+        f64::from(height),
+    );
     cr.clip();
     clear(cr);
     let _ = cr.restore();
@@ -155,11 +159,7 @@ fn measure(layout: &pango::Layout, y: f64) -> TextBlock {
     }
 }
 
-fn word_rects_cached(
-    geometry: &LyricGeometry,
-    line: &LyricLine,
-    time_ms: f64,
-) -> Vec<(f64, f64)> {
+fn word_rects_cached(geometry: &LyricGeometry, line: &LyricLine, time_ms: f64) -> Vec<(f64, f64)> {
     const BLEED: f64 = 2.0;
     let mut rects = Vec::new();
     let mut first_visible = true;
@@ -176,7 +176,11 @@ fn word_rects_cached(
         // The played layer contains only glyphs, so this cannot paint outside
         // the text, and it guarantees the first glyph is fully covered even if
         // Pango's advance origin has an unexpected bearing.
-        let start = if first_visible { 0.0 } else { (lo - BLEED).max(0.0) };
+        let start = if first_visible {
+            0.0
+        } else {
+            (lo - BLEED).max(0.0)
+        };
         first_visible = false;
         let end = if progress >= 1.0 {
             hi + BLEED
@@ -199,13 +203,7 @@ fn pango_x(layout: &pango::Layout, byte_index: usize, margin: f64, hi: f64) -> f
     x.clamp(0.0, hi)
 }
 
-fn draw_card_background(
-    cr: &Context,
-    width: i32,
-    top: f64,
-    bottom: f64,
-    cfg: &BackgroundConfig,
-) {
+fn draw_card_background(cr: &Context, width: i32, top: f64, bottom: f64, cfg: &BackgroundConfig) {
     if !cfg.enabled {
         return;
     }
@@ -230,39 +228,40 @@ pub struct LyricScene<'a> {
     pub placeholder: bool,
 }
 
-fn cache_key(scene: &LyricScene, width: i32, height: i32) -> String {
+/// Identifies everything baked into the cached text surfaces. The card
+/// background is painted separately in `draw_overlay`, so its config must not
+/// invalidate this cache. A 64-bit hash keeps the per-frame lookup
+/// allocation-free (this runs at the lyric fps). A collision would only reuse
+/// one stale frame until the key changes; that is accepted for this
+/// in-process visual cache.
+fn cache_key(scene: &LyricScene, width: i32, height: i32) -> u64 {
     let cfg = scene.cfg;
-    let line = scene.line;
-    format!(
-        "{}|{}|{}|{}|{}x{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
-        line.map(line_text).unwrap_or_default(),
-        line.map(|l| l.translated.as_str()).unwrap_or_default(),
-        line.map(|l| l.roman.as_str()).unwrap_or_default(),
-        scene.placeholder,
-        width,
-        height,
-        cfg.font_family,
-        cfg.font_size,
-        cfg.font_weight,
-        cfg.supersample,
-        cfg.played_color,
-        cfg.unplayed_color,
-        cfg.translation_color,
-        cfg.translation_px(),
-        cfg.show_translation,
-        cfg.show_romanization,
-        cfg.word_by_word,
-        cfg.background.enabled,
-        cfg.background.color,
-        cfg.background.alpha,
-        cfg.background.radius,
-        cfg.background.padding_x,
-        cfg.background.padding_y,
-    )
+    let mut hasher = DefaultHasher::new();
+    width.hash(&mut hasher);
+    height.hash(&mut hasher);
+    scene.placeholder.hash(&mut hasher);
+    cfg.font_family.hash(&mut hasher);
+    cfg.font_size.hash(&mut hasher);
+    cfg.font_weight.hash(&mut hasher);
+    cfg.supersample.to_bits().hash(&mut hasher);
+    cfg.played_color.hash(&mut hasher);
+    cfg.unplayed_color.hash(&mut hasher);
+    cfg.translation_color.hash(&mut hasher);
+    cfg.translation_px().hash(&mut hasher);
+    cfg.show_translation.hash(&mut hasher);
+    cfg.show_romanization.hash(&mut hasher);
+    if let Some(line) = scene.line {
+        for word in &line.words {
+            word.word.hash(&mut hasher);
+        }
+        line.translated.hash(&mut hasher);
+        line.roman.hash(&mut hasher);
+        (cfg.word_by_word && word_timing_usable(line)).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
-fn build_cache(scene: &LyricScene, width: i32, height: i32) -> Option<CachedLyrics> {
-    let key = cache_key(scene, width, height);
+fn build_cache(scene: &LyricScene, width: i32, height: i32, key: u64) -> Option<CachedLyrics> {
     let w = width.max(1);
     let h = height.max(1);
     let ss = scene.cfg.supersample;
@@ -288,7 +287,12 @@ fn build_cache(scene: &LyricScene, width: i32, height: i32) -> Option<CachedLyri
     })
 }
 
-fn downscale_surface(source: &cairo::ImageSurface, width: i32, height: i32, scale: f64) -> Option<cairo::ImageSurface> {
+fn downscale_surface(
+    source: &cairo::ImageSurface,
+    width: i32,
+    height: i32,
+    scale: f64,
+) -> Option<cairo::ImageSurface> {
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height).ok()?;
     let cr = Context::new(&surface).ok()?;
     let _ = cr.save();
@@ -309,7 +313,7 @@ fn draw_cached_lyrics(cr: &Context, width: i32, height: i32, scene: &LyricScene)
     CACHE.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.as_ref().map(|c| c.key != key).unwrap_or(true) {
-            *slot = build_cache(scene, width, height);
+            *slot = build_cache(scene, width, height, key);
         }
         let Some(cache) = slot.as_ref() else {
             draw_lyrics_mode(cr, width, height, scene, PaintMode::Both);
@@ -331,7 +335,10 @@ fn draw_cached_lyrics(cr: &Context, width: i32, height: i32, scene: &LyricScene)
             } else {
                 let progress = line_progress(line, scene.time_ms);
                 if progress > 0.0 {
-                    vec![(0.0, geometry.text_left + geometry.text_width * progress + 2.0)]
+                    vec![(
+                        0.0,
+                        geometry.text_left + geometry.text_width * progress + 2.0,
+                    )]
                 } else {
                     Vec::new()
                 }
@@ -360,7 +367,6 @@ fn draw_cached_lyrics(cr: &Context, width: i32, height: i32, scene: &LyricScene)
     });
 }
 
-
 fn draw_lyrics_mode(
     cr: &Context,
     width: i32,
@@ -371,9 +377,7 @@ fn draw_lyrics_mode(
     clear(cr);
     enable_grayscale_aa(cr);
 
-    let Some(line) = scene.line else {
-        return None;
-    };
+    let line = scene.line?;
 
     let cfg = scene.cfg;
     let h = f64::from(height);
@@ -381,25 +385,9 @@ fn draw_lyrics_mode(
     let max_width = (width - 2 * margin as i32).max(1);
 
     let main_text = line_text(line);
-    let translation = if cfg.show_translation {
-        line.translated.trim().to_string()
-    } else {
-        String::new()
-    };
-    let roman = if cfg.show_romanization {
-        line.roman.trim().to_string()
-    } else {
-        String::new()
-    };
-
-    let mut main_layout = None;
-    let mut translation_layout = None;
-    let mut roman_layout = None;
-
-    let mut main_height = 0.0;
-    let mut trans_height = 0.0;
-    let mut roman_height = 0.0;
     let gap = 6.0;
+    let mut main_layout = None;
+    let mut main_height = 0.0;
 
     if !main_text.is_empty() {
         let layout = make_layout(
@@ -414,6 +402,37 @@ fn draw_lyrics_mode(
         main_height = f64::from(logical.height());
         main_layout = Some(layout);
     }
+
+    // The played layer contains only the main lyric. Laying out translation,
+    // romanization and word geometry for this pass is wasted work.
+    if mode == PaintMode::Played {
+        if let Some(layout) = &main_layout {
+            let y = ((h - main_height) / 2.0).max(0.0);
+            let _ = cr.save();
+            cr.translate(margin, y.round());
+            set_rgb(cr, parse_color(&cfg.played_color));
+            pangocairo::functions::show_layout(cr, layout);
+            let _ = cr.restore();
+        }
+        return None;
+    }
+
+    let translation = if cfg.show_translation {
+        line.translated.trim().to_string()
+    } else {
+        String::new()
+    };
+    let roman = if cfg.show_romanization {
+        line.roman.trim().to_string()
+    } else {
+        String::new()
+    };
+
+    let mut translation_layout = None;
+    let mut roman_layout = None;
+    let mut trans_height = 0.0;
+    let mut roman_height = 0.0;
+
     if !translation.is_empty() {
         let layout = make_layout(
             cr,
@@ -450,44 +469,16 @@ fn draw_lyrics_mode(
     }
     // Anchor the main lyric line, not the whole block, so adding/removing a
     // translation line does not move the lyric line vertically.
-    let mut y = if main_height > 0.0 {
+    let y = if main_height > 0.0 {
         ((h - main_height) / 2.0).max(0.0)
     } else {
         ((h - block_height) / 2.0).max(0.0)
     };
 
-    let mut blocks = Vec::new();
     let mut main_block: Option<TextBlock> = None;
 
     if let Some(layout) = &main_layout {
-        let block = measure(layout, y);
-        blocks.push((
-            margin + block.ink_x,
-            y + block.ink_y,
-            block.ink_w,
-            block.ink_h,
-        ));
-        main_block = Some(block);
-        y += main_height + gap;
-    }
-    if let Some(layout) = &translation_layout {
-        let block = measure(layout, y);
-        blocks.push((
-            margin + block.ink_x,
-            y + block.ink_y,
-            block.ink_w,
-            block.ink_h,
-        ));
-        y += trans_height + gap;
-    }
-    if let Some(layout) = &roman_layout {
-        let block = measure(layout, y);
-        blocks.push((
-            margin + block.ink_x,
-            y + block.ink_y,
-            block.ink_w,
-            block.ink_h,
-        ));
+        main_block = Some(measure(layout, y));
     }
 
     let mut geometry: Option<LyricGeometry> = None;
@@ -526,15 +517,6 @@ fn draw_lyrics_mode(
             ink_height: ink_h,
             word_usable,
         });
-
-        if mode == PaintMode::Played {
-            let _ = cr.save();
-            cr.translate(margin, block.y.round());
-            set_rgb(cr, parse_color(&cfg.played_color));
-            pangocairo::functions::show_layout(cr, &block.layout);
-            let _ = cr.restore();
-            return None;
-        }
 
         let _ = cr.save();
         cr.translate(margin, block.y.round());
@@ -657,8 +639,7 @@ pub fn controls_geometry(cfg: &ControlsConfig, width: i32, height: i32) -> Contr
     let handle_x = (w - f64::from(cfg.right_margin) - HANDLE_WIDTH).max(0.0);
     let handle = (handle_x, top, HANDLE_WIDTH, size);
     let hide_size = 28.0;
-    let hide: (f64, f64, f64, f64) =
-        (16.0, top + (size - hide_size) / 2.0, hide_size, hide_size);
+    let hide: (f64, f64, f64, f64) = (16.0, top + (size - hide_size) / 2.0, hide_size, hide_size);
     let pad = 6.0;
     let mut input_rects = Vec::new();
     input_rects.push((
@@ -690,7 +671,11 @@ pub fn controls_geometry(cfg: &ControlsConfig, width: i32, height: i32) -> Contr
     }
 }
 
-pub fn input_region_rects(cfg: &ControlsConfig, width: i32, height: i32) -> Vec<(i32, i32, i32, i32)> {
+pub fn input_region_rects(
+    cfg: &ControlsConfig,
+    width: i32,
+    height: i32,
+) -> Vec<(i32, i32, i32, i32)> {
     controls_geometry(cfg, width, height).input_rects
 }
 
@@ -725,6 +710,46 @@ pub fn hide_hit(cfg: &ControlsConfig, width: i32, height: i32, x: f64, y: f64) -
     x >= hx - 4.0 && x <= hx + hw + 4.0 && y >= hy - 4.0 && y <= hy + hh + 4.0
 }
 
+/// What the pointer is over at press time. `Pad` covers the input-region
+/// padding around controls and is draggable but not clickable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressTarget {
+    Prev,
+    PlayPause,
+    Next,
+    Hide,
+    Handle,
+    Pad,
+}
+
+pub fn press_target(
+    cfg: &ControlsConfig,
+    width: i32,
+    height: i32,
+    x: f64,
+    y: f64,
+) -> Option<PressTarget> {
+    // Hide and handle are drawn above the controls; keep the original
+    // hide-first priority when a very large control circle overlaps them.
+    if hide_hit(cfg, width, height, x, y) {
+        return Some(PressTarget::Hide);
+    }
+    if handle_hit(cfg, width, height, x, y) {
+        return Some(PressTarget::Handle);
+    }
+    if let Some(index) = controls_hit(cfg, width, height, x, y) {
+        return Some(match index {
+            0 => PressTarget::Prev,
+            1 => PressTarget::PlayPause,
+            _ => PressTarget::Next,
+        });
+    }
+    if input_contains(cfg, width, height, x, y) {
+        return Some(PressTarget::Pad);
+    }
+    None
+}
+
 pub fn input_contains(cfg: &ControlsConfig, width: i32, height: i32, x: f64, y: f64) -> bool {
     controls_geometry(cfg, width, height)
         .input_rects
@@ -737,23 +762,26 @@ pub fn input_contains(cfg: &ControlsConfig, width: i32, height: i32, x: f64, y: 
         })
 }
 
-pub fn measure_card_width(cfg: &Config, line: Option<&LyricLine>, placeholder: bool) -> i32 {
+/// Returns `None` only when the temporary Cairo surface cannot be created, so
+/// the caller can retry on the next poll instead of caching a fallback width.
+pub fn measure_card_width(cfg: &Config, line: Option<&LyricLine>) -> Option<i32> {
     let Some(line) = line else {
-        return 600;
+        return Some(600);
     };
-    let surface = match cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1) {
-        Ok(s) => s,
-        Err(_) => return 600,
-    };
-    let cr = match Context::new(&surface) {
-        Ok(c) => c,
-        Err(_) => return 600,
-    };
+    let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1).ok()?;
+    let cr = Context::new(&surface).ok()?;
     let margin = 24.0f64;
     let mut text_width = 0.0f64;
     let main = line_text(line);
     if !main.is_empty() {
-        let layout = make_layout(&cr, &cfg.font_family, cfg.font_size, cfg.font_weight, &main, 10000);
+        let layout = make_layout(
+            &cr,
+            &cfg.font_family,
+            cfg.font_size,
+            cfg.font_weight,
+            &main,
+            10000,
+        );
         text_width = f64::from(layout.pixel_extents().0.width());
     }
     if cfg.show_translation && !line.translated.trim().is_empty() {
@@ -785,27 +813,40 @@ pub fn measure_card_width(cfg: &Config, line: Option<&LyricLine>, placeholder: b
         + HANDLE_WIDTH
         + f64::from(cfg.controls.right_margin)
         + 24.0;
-    let _ = placeholder;
+    let horizontal_padding = f64::from(cfg.background.padding_x) * 2.0;
     let content = if text_width <= 0.0 {
         controls_total
     } else {
-        (text_width + margin * 2.0 + 48.0).max(controls_total)
+        (text_width + margin * 2.0 + horizontal_padding).max(controls_total)
     };
-    (content.round() as i32).clamp(320, 4096)
+    Some((content.round() as i32).clamp(320, 4096))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CardRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HoverState {
+    pub control: Option<usize>,
+    pub handle: bool,
+    pub hide: bool,
 }
 
 pub fn draw_overlay(
     cr: &Context,
-    card_x: i32,
-    card_y: i32,
-    width: i32,
-    height: i32,
+    card: CardRect,
     scene: &LyricScene,
     cfg: &Config,
     playing: bool,
-    hover: Option<usize>,
-    hover_handle: bool,
+    hover: HoverState,
 ) {
+    let width = card.width;
+    let height = card.height;
     let controls = &cfg.controls;
     let controls_h = if controls.enabled {
         (controls.size + controls.bottom_margin).max(0)
@@ -814,7 +855,7 @@ pub fn draw_overlay(
     };
     let lyric_h = (height - controls_h).max(60);
     let _ = cr.save();
-    cr.translate(f64::from(card_x), f64::from(card_y));
+    cr.translate(f64::from(card.x), f64::from(card.y));
     cr.rectangle(0.0, 0.0, f64::from(width), f64::from(height));
     cr.clip();
     let font_h = f64::from(cfg.font_size) * 1.35;
@@ -835,8 +876,9 @@ pub fn draw_overlay(
     } else {
         0.0
     };
-    let shadow_top = (main_top - 8.0).max(0.0);
-    let shadow_bottom = (text_bottom.max(controls_bottom) + 8.0).min(f64::from(height));
+    let pad_y = f64::from(cfg.background.padding_y);
+    let shadow_top = (main_top - pad_y).max(0.0);
+    let shadow_bottom = (text_bottom.max(controls_bottom) + pad_y).min(f64::from(height));
     draw_card_background(
         cr,
         width,
@@ -848,18 +890,19 @@ pub fn draw_overlay(
 
     let geometry = controls_geometry(controls, width, height);
     if controls.enabled {
-        draw_controls(cr, &geometry, controls, playing, hover);
+        draw_controls(cr, &geometry, controls, playing, hover.control);
     }
-    draw_handle(cr, &geometry, hover_handle);
-    draw_hide_button(cr, &geometry, hover.is_some());
+    draw_handle(cr, &geometry, hover.handle, controls.opacity);
+    draw_hide_button(cr, &geometry, hover.hide, controls.opacity);
     let _ = cr.restore();
 }
 
-fn draw_hide_button(cr: &Context, geometry: &ControlsGeometry, hovered: bool) {
+fn draw_hide_button(cr: &Context, geometry: &ControlsGeometry, hovered: bool, opacity: f64) {
     let (hx, hy, hw, hh) = geometry.hide;
     let cx = hx + hw / 2.0;
     let cy = hy + hh / 2.0;
-    cr.set_source_rgba(1.0, 1.0, 1.0, if hovered { 0.95 } else { 0.75 });
+    let alpha = if hovered { 0.95 } else { 0.75 };
+    cr.set_source_rgba(1.0, 1.0, 1.0, alpha * opacity);
     cr.set_line_width(2.0);
     cr.move_to(cx - 7.0, cy - 2.0);
     cr.line_to(cx, cy + 5.0);
@@ -867,12 +910,12 @@ fn draw_hide_button(cr: &Context, geometry: &ControlsGeometry, hovered: bool) {
     let _ = cr.stroke();
 }
 
-fn draw_handle(cr: &Context, geometry: &ControlsGeometry, hovered: bool) {
+fn draw_handle(cr: &Context, geometry: &ControlsGeometry, hovered: bool, opacity: f64) {
     let (hx, hy, hw, hh) = geometry.handle;
     let cx = hx + hw / 2.0;
     let cy = hy + hh / 2.0;
     let alpha = if hovered { 0.98 } else { 0.72 };
-    cr.set_source_rgba(1.0, 1.0, 1.0, alpha);
+    cr.set_source_rgba(1.0, 1.0, 1.0, alpha * opacity);
     for row in -1..=1 {
         for col in 0..2 {
             let x = cx + (col as f64 - 0.5) * 5.0;
@@ -886,14 +929,15 @@ fn draw_handle(cr: &Context, geometry: &ControlsGeometry, hovered: bool) {
 fn draw_controls(
     cr: &Context,
     geometry: &ControlsGeometry,
-    _cfg: &ControlsConfig,
+    cfg: &ControlsConfig,
     playing: bool,
     hover: Option<usize>,
 ) {
     cr.set_antialias(cairo::Antialias::Gray);
     for (i, (cx, cy, r)) in geometry.buttons.iter().copied().enumerate() {
         let hovered = hover == Some(i);
-        cr.set_source_rgba(1.0, 1.0, 1.0, if hovered { 1.0 } else { 0.86 });
+        let alpha = if hovered { 1.0 } else { 0.86 };
+        cr.set_source_rgba(1.0, 1.0, 1.0, alpha * cfg.opacity);
         let u = r * 0.34;
         match i {
             0 => {
@@ -961,11 +1005,135 @@ mod tests {
         assert_eq!(controls_hit(&cfg, width, height, 300.0, 22.0), None);
 
         let (hx, hy, hw, hh) = geometry.handle;
-        assert!(handle_hit(&cfg, width, height, hx + hw / 2.0, hy + hh / 2.0));
+        assert!(handle_hit(
+            &cfg,
+            width,
+            height,
+            hx + hw / 2.0,
+            hy + hh / 2.0
+        ));
         assert!(!geometry.input_rects.is_empty());
         for (ix, iy, iw, ih) in &geometry.input_rects {
             assert!(*ix >= 0 && *iy >= 0 && *iw > 0 && *ih > 0);
         }
+    }
+
+    #[test]
+    fn cache_key_tracks_text_but_not_background() {
+        use crate::model::LyricWord;
+
+        let line = LyricLine {
+            words: vec![LyricWord {
+                word: "hello".to_string(),
+                ..Default::default()
+            }],
+            translated: "你好".to_string(),
+            ..Default::default()
+        };
+
+        let base = {
+            let cfg = Config::default();
+            let scene = LyricScene {
+                cfg: &cfg,
+                line: Some(&line),
+                time_ms: 0.0,
+                placeholder: false,
+            };
+            cache_key(&scene, 800, 200)
+        };
+
+        let background_changed = {
+            let mut cfg = Config::default();
+            cfg.background.alpha = 0.9;
+            cfg.background.padding_x = 1;
+            let scene = LyricScene {
+                cfg: &cfg,
+                line: Some(&line),
+                time_ms: 0.0,
+                placeholder: false,
+            };
+            cache_key(&scene, 800, 200)
+        };
+        assert_eq!(base, background_changed);
+
+        let font_changed = {
+            let mut cfg = Config::default();
+            cfg.font_size += 1;
+            let scene = LyricScene {
+                cfg: &cfg,
+                line: Some(&line),
+                time_ms: 0.0,
+                placeholder: false,
+            };
+            cache_key(&scene, 800, 200)
+        };
+        assert_ne!(base, font_changed);
+    }
+
+    #[test]
+    fn press_target_maps_all_interactive_zones() {
+        let cfg = ControlsConfig::default();
+        let width = 800;
+        let height = 200;
+        let geometry = controls_geometry(&cfg, width, height);
+
+        for (index, target) in [
+            (0, PressTarget::Prev),
+            (1, PressTarget::PlayPause),
+            (2, PressTarget::Next),
+        ] {
+            let (cx, cy, _) = geometry.buttons[index];
+            assert_eq!(press_target(&cfg, width, height, cx, cy), Some(target));
+        }
+
+        let (hx, hy, hw, hh) = geometry.hide;
+        assert_eq!(
+            press_target(&cfg, width, height, hx + hw / 2.0, hy + hh / 2.0),
+            Some(PressTarget::Hide)
+        );
+        let (hx, hy, hw, hh) = geometry.handle;
+        assert_eq!(
+            press_target(&cfg, width, height, hx + hw / 2.0, hy + hh / 2.0),
+            Some(PressTarget::Handle)
+        );
+
+        // Inside the padded input rect but outside every control's shape.
+        let controls_left =
+            (f64::from(width) - 3.0 * f64::from(cfg.size) - 2.0 * CONTROLS_GAP) / 2.0;
+        let top = f64::from(height - cfg.bottom_margin - cfg.size);
+        assert_eq!(
+            press_target(&cfg, width, height, controls_left - 4.0, top + 4.0),
+            Some(PressTarget::Pad)
+        );
+
+        assert_eq!(press_target(&cfg, width, height, 400.0, 60.0), None);
+    }
+
+    #[test]
+    fn hide_and_handle_win_over_overlapping_controls() {
+        let large = ControlsConfig {
+            size: 100,
+            right_margin: 0,
+            ..Default::default()
+        };
+        let geometry = controls_geometry(&large, 364, 200);
+        let (hx, hy, hw, hh) = geometry.hide;
+        assert_eq!(
+            press_target(&large, 364, 200, hx + hw / 2.0, hy + hh / 2.0),
+            Some(PressTarget::Hide)
+        );
+
+        let tight = ControlsConfig {
+            size: 70,
+            right_margin: 48,
+            ..Default::default()
+        };
+        let geometry = controls_geometry(&tight, 322, 200);
+        let (hx, hy, hw, hh) = geometry.handle;
+        assert_eq!(
+            press_target(&tight, 322, 200, hx + hw / 2.0, hy + hh / 2.0),
+            Some(PressTarget::Handle)
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
     "poll_ms": 900
   },
   "output": "HDMI-A-1",
+  "width_mode": "center",
   "width": 1800,
   "height": 200,
   "bottom_margin": 96,

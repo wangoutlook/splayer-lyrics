@@ -12,3 +12,6 @@
 *.swp
 .idea/
 .vscode/
+
+# Local AI tooling state
+.claude/

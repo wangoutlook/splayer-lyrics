@@ -3,7 +3,7 @@
 [English](README.en.md) | **简体中文**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.1.0-blue)
 [![Platform](https://img.shields.io/badge/platform-Wayland%20%7C%20niri-blue)](https://github.com/YaLTeR/niri)
 ![Rust](https://img.shields.io/badge/rust-stable-orange)
 
@@ -41,7 +41,10 @@
 - **自动显隐**：只在 SPlayer-Next 运行时显示；播放器关闭或 API 不可达时，卡片、
   阴影和控件全部不绘制，屏幕不残留任何东西。
 - **可拖动**：拖动控制按钮或右下角六点手柄移动卡片，位置自动保存。
-- **托盘控制栏**：字号、字体、配色、显示器切换、显示/隐藏、退出。
+- **卡片伸缩方向**：歌词变长时可选对称伸缩、向左伸缩（右边缘不动）或向右伸缩
+  （左边缘不动），可在托盘切换。
+- **托盘控制栏**：字号、字体、宽度变化、翻译/罗马音开关、歌词偏移、配色、
+  显示器切换、显示/隐藏、退出。
 - **左下角隐藏按钮**：一键收起整张卡片，之后可从托盘重新显示。
 - **主题色同步**：可从 niri / Waybar 配置读取当前强调色，并每 5 秒跟随变化。
 - **低占用**：播放器关闭时约 22 MB PSS / 0.2% 单核 CPU。
@@ -135,10 +138,22 @@ stderr。`start.sh` 会把 stderr 重定向到 `runtime/run.log`。
 ### 拖动
 
 - 按住底部居中的上一首 / 播放暂停 / 下一首，或右下角六点手柄拖动。
+- 按下后超过系统拖动阈值才进入拖动，因此拖动控制按钮不会误触播放/暂停。
 - 松开后位置保存到 `runtime/position.json`，下次启动恢复。
 - 卡片宽度会随歌词长度变化，但始终以保存的水平中心为锚点。
 - 拖动只改变卡片在固定全屏 surface 内的坐标，指针跟手，不会和合成器的窗口
   移动反馈打架。
+
+### 卡片伸缩方向
+
+歌词行变长或变短时，卡片宽度的锚点由 `width_mode`（或托盘“宽度变化”）决定：
+
+- `center`（默认）：中心不动，左右对称伸缩；
+- `left`：右边缘固定，变宽时向左扩展，变窄时向右收缩；
+- `right`：左边缘固定，变宽时向右扩展，变窄时向左收缩。
+
+托盘切换后立即生效，下一次歌词行宽度变化时按新方向布局，当前卡片不会瞬移。
+`runtime/position.json` 同时保存卡片中心和宽度，重启后可以恢复上次布局。
 
 ### 隐藏
 
@@ -151,22 +166,35 @@ stderr。`start.sh` 会把 stderr 重定向到 `runtime/run.log`。
 | 菜单 | 作用 |
 |---|---|
 | 显示/隐藏歌词 | 切换整张卡片的可见性 |
+| 显示翻译 / 显示罗马音 | 切换对应副行 |
 | 字号 | 28 / 32 / 36 / 40 px |
 | 字体 | Noto Sans + CJK、Noto Sans CJK、霞鹜文楷 Screen、Noto Serif CJK |
-| 显示器 | HDMI-A-1（主屏）/ eDP-1（笔记本） |
+| 宽度变化 | 对称伸缩（中心不动）、向左伸缩（右边缘不动）、向右伸缩（左边缘不动） |
+| 歌词偏移 | 在当前值上 -100 / -50 / +50 / +100 ms，或重置为 0（范围 ±30 s） |
+| 显示器 | 枚举当前 GDK monitor；插拔后自动重启并刷新 |
 | 配色 | 跟随系统主题色、SPlayer 粉、白、蓝、绿 |
 | 退出 | 结束覆盖层进程 |
 
-字号、字体、颜色和可见性保存在 `runtime/ui.json`，优先于 `config.json` 中的
-默认值。托盘是 StatusNotifierItem，需要 Waybar 的 `tray` 模块。
+字号、字体、颜色、可见性、宽度模式、翻译/罗马音开关和歌词偏移保存在
+`runtime/ui.json`，优先于 `config.json` 中的默认值。托盘是
+StatusNotifierItem，需要 Waybar 的 `tray` 模块。
 
-### 显示器切换
+### 显示器选择
 
-- 托盘“显示器”会改写 `config.json` 的 `output`，然后通过 `start.sh` 重启进程，
-  约 1 秒闪断。
-- 只是把卡片移动到目标屏幕，**不支持拖过屏幕边界**；layer-shell surface 绑定在
-  单个输出上。
-- 切换后如果卡片位置偏出屏幕，直接拖回来即可；位置文件仍保存原来的相对位置。
+覆盖层启动时按以下顺序选屏：
+
+1. `runtime/ui.json` 里的 `last_output`（上次所在的屏）；
+2. 上次的屏已不在时，用 `config.json` 的 `output`（仅作为首次启动的种子）；
+3. 两者都不可用时，选**当前分辨率最高**的显示器；面积相同取枚举顺序靠前的。
+
+把 `config.json` 的 `output` 设为 `auto` 可以跳过上面的第 2 步（`last_output` 仍然优先）。
+
+插拔显示器或改变分辨率时，程序等待 350 ms 让布局稳定，然后保存位置并自动重启
+（约 1 秒闪断）。重启后重新按上面的顺序选屏，新插入的显示器也会出现在托盘菜单
+里。从托盘选择会改写 `config.json` 的 `output`、把选择记进 `ui.json`，然后重启。
+
+只是把卡片放到目标屏幕，**不支持拖过屏幕边界**；layer-shell surface 绑定在单个
+输出上。切换后如果卡片偏出屏幕，直接拖回来即可；位置文件仍保存原来的相对位置。
 
 ### 主题色
 
@@ -214,6 +242,7 @@ niri validate
 {
   "api": {"host": "127.0.0.1", "port": 14558, "poll_ms": 900},
   "output": "HDMI-A-1",
+  "width_mode": "center",
   "width": 1800,
   "height": 200,
   "bottom_margin": 96,
@@ -254,7 +283,8 @@ niri validate
 |---|---|---|
 | `api.host` / `api.port` | `127.0.0.1` / `14558` | SPlayer-Next 外部 API 地址 |
 | `api.poll_ms` | `900` | 轮询间隔（毫秒） |
-| `output` | `HDMI-A-1` | 显示器 connector，匹配 `Gdk.Monitor.connector()` |
+| `output` | `HDMI-A-1` | 首次启动的显示器种子；之后优先用 `runtime/ui.json` 的 `last_output`，都不可用时选分辨率最高的屏 |
+| `width_mode` | `center` | 宽度变化方向：`center` 对称、`left` 右边缘固定、`right` 左边缘固定 |
 | `width` | `1800` | 初始/回退卡片宽度；实际宽度按歌词动态测量 |
 | `height` | `200` | 卡片固定高度 |
 | `bottom_margin` | `96` | 没有位置文件时距屏幕底部的距离 |
@@ -277,7 +307,7 @@ niri validate
 | `background.color` | `#000000` | 阴影颜色 |
 | `background.alpha` | `0.22` | 阴影不透明度，越低越透明 |
 | `background.radius` | `14` | 圆角半径 |
-| `background.padding_x` / `padding_y` | `28` / `12` | 卡片内边距 |
+| `background.padding_x` / `padding_y` | `28` / `12` | 卡片内边距；水平值参与宽度测量，垂直值为背景上下留白 |
 | `controls.enabled` | `true` | 是否显示底部控制 |
 | `controls.right_margin` | `48` | 六点手柄距卡片右边缘的距离 |
 | `controls.bottom_margin` | `24` | 控制区距卡片底部的距离 |
@@ -292,17 +322,18 @@ niri validate
   `background` 或 `show_translation`。
 - 内存主要由 GTK/Pango 和全屏透明 surface 占据。`GSK_RENDERER=cairo` 和
   `GTK_A11Y=none` 很重要，GL 渲染器大约会让 PSS 翻倍。
-- 托盘选择会写入 `runtime/ui.json`，之后改 `config.json` 里的字体/字号/颜色不会
-  覆盖已保存的托盘选择；删除 `runtime/ui.json` 可恢复配置文件默认值。
+- 托盘选择会写入 `runtime/ui.json`，之后改 `config.json` 里的字体/字号/颜色/
+  宽度模式/翻译开关/歌词偏移不会覆盖已保存的托盘选择；删除 `runtime/ui.json`
+  可恢复配置文件默认值。
 
 ## 运行时文件
 
 | 文件 | 说明 |
 |---|---|
 | `runtime/pid` | 当前进程 PID |
-| `runtime/run.log` | 追加式、带时间戳的运行日志 |
-| `runtime/position.json` | 卡片水平中心与距底部距离 |
-| `runtime/ui.json` | 托盘设置：可见性、字号、字体、颜色、是否跟随系统色 |
+| `runtime/run.log` | 追加式、带时间戳的运行日志；`start.sh` 启动时若超过 5 MB 轮转为 `run.log.1` |
+| `runtime/position.json` | 卡片水平中心、宽度与距底部距离 |
+| `runtime/ui.json` | 托盘设置：可见性、字号、字体、颜色、主题色跟随、宽度模式、翻译/罗马音、歌词偏移、上次所在的显示器 |
 | `runtime/*.png` | 测试截图（不参与运行） |
 
 这些文件全部被 `.gitignore` 忽略，不会进入仓库。
@@ -320,8 +351,9 @@ flowchart LR
 ```
 
 - 后台线程每 `api.poll_ms` 轮询一次 `GET /api/now-playing`，超时 1.5 秒。
-- 每次轮询用 `position + clamp(local_now_ms - sendTimestamp, 0, 5000) * speed`
-  重新锚定播放时钟；两次轮询之间由 GTK 主循环按 `fps` 本地插值。
+- 每次轮询计算 `position + clamp(local_now_ms - sendTimestamp, 0, 5000) * speed`
+  作为上报位置；与本地预测相差超过 120 ms 才重新锚定，否则保留本地时钟以避免
+  轮询抖动。两次轮询之间由 GTK 主循环按 `fps` 本地插值。
 - 曲目变化或 `lyricAvailable` 为真但尚未加载歌词时，请求 `GET /api/lyrics`；
   `trackId` 不匹配的响应会被丢弃。
 - 没有歌词时显示“歌名 + 歌手”，拿到歌词后立即切换。
@@ -342,7 +374,7 @@ flowchart LR
 - **2× 文字超采样**：每行只排版/缓存一次，换行时才有 CPU 峰值；比每帧高质量
   渲染更稳。
 - **只绑定一个输出**：跨屏拖动需要为每个显示器创建 surface 并引入全局坐标，
-  复杂度高；当前用托盘切屏覆盖大部分使用场景。
+  复杂度高；插拔或分辨率变化通过自动重启换屏来覆盖大部分使用场景。
 - **只轮询 HTTP API**：不依赖 WebSocket/MPRIS，行为稳定，也方便跨机器使用。
 
 ## 性能
@@ -407,11 +439,13 @@ curl -fsS http://127.0.0.1:14558/api/now-playing
 tail -50 runtime/run.log
 ```
 
-常见原因：缺少 `gtk4-layer-shell`、不在 Wayland 会话、显示器 connector 名称写错。
+常见原因：缺少 `gtk4-layer-shell`、不在 Wayland 会话、显示器 connector 名称写错
+（会回退到分辨率最高的屏，可查看 `runtime/run.log` 的 `selected monitor`）。
 
 ## 已知限制
 
 - 一次只绑定一个输出；托盘可以切换显示器，但不能把卡片拖过屏幕边界。
+  插拔显示器或改变分辨率会自动重启覆盖层（约 1 秒）。
 - 仅支持 Wayland；没有 X11、Windows 或 macOS 版本。
 - 仅适配 SPlayer-Next 的 HTTP API，不支持其他播放器。
 - 托盘依赖 StatusNotifierWatcher（Waybar）；没有托盘时仍可运行，但只能用配置文件。
@@ -426,9 +460,11 @@ tail -50 runtime/run.log
 - [x] 共享阴影、隐藏按钮、点击穿透
 - [x] StatusNotifierItem 托盘菜单
 - [x] 字号 / 字体 / 配色 / 显示隐藏 / 退出
+- [x] 托盘翻译/罗马音开关、歌词偏移
 - [x] 跟随 niri / Waybar 主题色
-- [x] 托盘切换显示器
+- [x] 托盘切换显示器（动态枚举）
 - [x] 播放器关闭时不绘制任何内容
+- [x] 可选卡片伸缩方向（对称 / 向左 / 向右）
 - [ ] 真正的跨显示器拖动（每屏一个 surface + 全局坐标）
 - [ ] 自定义快捷键
 - [ ] systemd 用户服务 / 更通用的自启动方案
