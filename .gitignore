@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Runtime state: pid, logs, screenshots, saved position and tray settings
+/runtime/
+
+# Local backups (tarballs, niri config snapshots)
+/backups/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
