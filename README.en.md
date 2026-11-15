@@ -145,8 +145,9 @@ You can also run the binary directly:
 - The position is saved to `runtime/position.json` on release.
 - The card width follows the current lyric line, anchored at the saved
   horizontal center.
-- Only the card coordinates change; the full-output surface itself never moves,
-  so dragging stays 1:1 with the pointer.
+- The layer surface is the size of the card; dragging moves it with layer-shell
+  margins, converting "surface origin + local coordinates" back to monitor space
+  so the moving window cannot fight the pointer.
 
 ### Width growth direction
 
@@ -382,8 +383,8 @@ flowchart LR
 - The full line is laid out once with Pango; word x-ranges come from byte
   indexes. The played part is drawn by clipping rectangles and drawing the same
   layout again in the played color.
-- The card lives inside a fixed full-output transparent layer-shell surface.
-  Dragging changes card coordinates, not the surface.
+- The card is its own layer-shell surface, positioned with margins, so each
+  frame only repaints the card instead of the whole monitor.
 - The input region contains only the hide button, the three controls and the
   handle; the lyric area is click-through.
 - Controls POST to `/api/prev`, `/api/play`, `/api/pause`, `/api/next`, then
@@ -392,9 +393,9 @@ flowchart LR
 
 ### Design trade-offs
 
-- **Fixed fullscreen surface instead of a moving small window**: stable drag
-  feedback and no position jump when entering fullscreen; costs more memory and
-  compositing.
+- **Card-sized surface instead of a full-output one**: Wayland double buffering
+  drops from ~29 MB to under 1 MB and each frame paints ~90% fewer pixels; the
+  trade-off is converting surface-local drag coordinates back to monitor space.
 - **Cairo by default**: much less memory than GL; the drawing load is small.
 - **2× supersampled text**: laid out and cached once per line, so CPU spikes
   only on line changes.
@@ -411,13 +412,14 @@ Measured on this machine (niri, HDMI-A-1 2560×1440, `fps=20`,
 
 | State | RSS | PSS | CPU (one core) |
 |---|---:|---:|---:|
-| Playing, lyrics visible | ~88–96 MB | ~42–50 MB | ~5–7% |
-| Paused, player open | ~88 MB | ~42 MB | ~0.4% |
-| SPlayer closed / API down (nothing drawn) | ~62 MB | ~22 MB | ~0.2% |
+| Playing, lyrics visible | ~55–60 MB | ~22–24 MB | ~1.6–2.0% |
+| Paused, player open | ~55 MB | ~22 MB | ~0.4% |
+| SPlayer closed / API down (nothing drawn) | ~50 MB | ~20 MB | ~0.2% |
 
-The full-output transparent surface and the 2× text cache dominate memory; line
-changes cause short CPU spikes. `supersample=1.5` lowers PSS noticeably with
-slightly softer text.
+With a card around 800×200 the two Wayland buffers total about 0.5 MB (a
+full-output surface needed ~29 MB). Line changes still cause a short CPU spike
+while the 2× text cache is downsampled; `supersample=1.5` reduces that spike
+with slightly softer text.
 
 The release binary is about 7.4 MB (the tray pulls in zbus). These numbers cover
 the overlay process only, not SPlayer-Next.

@@ -173,6 +173,20 @@ fn save_ui_settings(path: &Path, settings: &UiSettings) {
     }
 }
 
+/// Geometry of the layer surface, which is sized to the lyric card instead of
+/// the whole monitor. `left`/`top` are layer-shell margins, while `draw_x`/
+/// `draw_y` offset the card inside the surface when it is clipped at a screen
+/// edge (`draw_x` is <= 0 in that case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurfaceMetrics {
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+    draw_x: i32,
+    draw_y: i32,
+}
+
 /// Everything needed to recompute the input region without holding a borrow
 /// on `UiState`. Only the controls config matters to layout, not the whole
 /// config, so message handlers can cheaply snapshot it.
@@ -181,8 +195,9 @@ struct InputRegionSpec {
     controls: ControlsConfig,
     card_height: i32,
     card_width: i32,
-    card_x: i32,
-    card_y: i32,
+    /// Card origin inside the surface (see [`SurfaceMetrics::draw_x`]).
+    origin_x: i32,
+    origin_y: i32,
     visible: bool,
 }
 
@@ -213,6 +228,23 @@ fn next_win_x(mode: WidthMode, old_win_x: i32, old_width: i32, new_width: i32) -
         WidthMode::Left => old_card_x + old_width - new_width + new_width / 2,
         // Grow/shrink towards the right: the left edge stays fixed.
         WidthMode::Right => old_card_x + new_width / 2,
+    }
+}
+
+/// `GestureDrag` reports offsets in surface-local coordinates, and the surface
+/// moves with the card. Add the origin shift so the caller gets a stable
+/// monitor-space delta (used by [`interaction::PointerState::drag_update`]).
+fn drag_monitor_delta(
+    press_origin: Option<(i32, i32)>,
+    current_origin: (i32, i32),
+    offset: (f64, f64),
+) -> (f64, f64) {
+    match press_origin {
+        Some((press_x, press_y)) => (
+            offset.0 + f64::from(current_origin.0 - press_x),
+            offset.1 + f64::from(current_origin.1 - press_y),
+        ),
+        None => offset,
     }
 }
 
@@ -352,6 +384,10 @@ struct UiState {
     hover_hide: bool,
     pointer_x: Option<f64>,
     pointer_y: Option<f64>,
+    /// Surface origin (layer-shell margin) at drag start. `GestureDrag` offsets
+    /// are surface-local and the surface itself moves with the card, so the
+    /// monitor-space delta is `offset + (origin_now - origin_at_press)`.
+    drag_press_origin: Option<(i32, i32)>,
     last_width_fingerprint: Option<u64>,
     win_x: i32,
     win_y: i32,
@@ -405,6 +441,7 @@ impl UiState {
             hover_hide: false,
             pointer_x: None,
             pointer_y: None,
+            drag_press_origin: None,
             last_width_fingerprint: None,
             win_x,
             win_y,
@@ -469,6 +506,56 @@ impl UiState {
             .clamp(0, (self.monitor_h - self.cfg.height).max(0))
     }
 
+    /// The layer surface only covers the card, so every frame repaints a small
+    /// area instead of the whole monitor. A card pushed past a screen edge is
+    /// clipped by shrinking the surface and offsetting the drawing inside it.
+    fn surface_metrics(&self) -> SurfaceMetrics {
+        let card_x = self.card_x();
+        let card_w = self.card_width.max(1);
+        let monitor_w = self.monitor_w.max(1);
+        let left = card_x.clamp(0, monitor_w - 1);
+        let right = (card_x + card_w).clamp(left + 1, monitor_w);
+        SurfaceMetrics {
+            left,
+            top: self.card_y(),
+            width: right - left,
+            height: self.cfg.height.max(1),
+            draw_x: card_x - left,
+            draw_y: 0,
+        }
+    }
+
+    /// Push the card geometry to the layer surface. Called after any change to
+    /// width, position, or monitor size.
+    fn sync_surface(&self, label: &str) {
+        let (Some(window), Some(area)) = (&self.window, &self.area) else {
+            return;
+        };
+        let metrics = self.surface_metrics();
+        apply_layer_geometry(window, area, &metrics);
+        apply_input_region(window, &self.input_region_spec(), label);
+    }
+
+    fn card_visible(&self) -> bool {
+        self.visible && (self.api_ok || !self.cfg.hide_when_disconnected)
+    }
+
+    fn input_region_spec(&self) -> InputRegionSpec {
+        let metrics = self.surface_metrics();
+        InputRegionSpec {
+            controls: self.cfg.controls.clone(),
+            card_height: self.cfg.height,
+            card_width: self.card_width,
+            origin_x: metrics.draw_x,
+            origin_y: metrics.draw_y,
+            visible: self.card_visible(),
+        }
+    }
+
+    fn refresh_input_region(&self, label: &str) {
+        self.sync_surface(label);
+    }
+
     /// Returns whether the measured width changed, so the tick loop can
     /// refresh the input region. Message handlers run through `update_ui`,
     /// which applies the region once after the mutation.
@@ -522,27 +609,6 @@ impl UiState {
                 self.width_initialized = true;
             }
             false
-        }
-    }
-
-    fn card_visible(&self) -> bool {
-        self.visible && (self.api_ok || !self.cfg.hide_when_disconnected)
-    }
-
-    fn input_region_spec(&self) -> InputRegionSpec {
-        InputRegionSpec {
-            controls: self.cfg.controls.clone(),
-            card_height: self.cfg.height,
-            card_width: self.card_width,
-            card_x: self.card_x(),
-            card_y: self.card_y(),
-            visible: self.card_visible(),
-        }
-    }
-
-    fn refresh_input_region(&self, label: &str) {
-        if let Some(window) = &self.window {
-            apply_input_region(window, &self.input_region_spec(), label);
         }
     }
 
@@ -1119,19 +1185,40 @@ fn apply_input_region(window: &gtk4::Window, spec: &InputRegionSpec, label: &str
         let rects = render::input_region_rects(&spec.controls, spec.card_width, spec.card_height);
         let region = cairo::Region::create();
         for (x, y, w, h) in &rects {
-            let rect = cairo::RectangleInt::new(x + spec.card_x, y + spec.card_y, *w, *h);
+            let rect = cairo::RectangleInt::new(x + spec.origin_x, y + spec.origin_y, *w, *h);
             let _ = region.union_rectangle(&rect);
         }
         surface.set_input_region(Some(&region));
         logging::debug(&format!(
-            "input region {label}: {} rect(s), card=({},{}) (lyrics click-through)",
+            "input region {label}: {} rect(s), origin=({},{}) (lyrics click-through)",
             rects.len(),
-            spec.card_x,
-            spec.card_y
+            spec.origin_x,
+            spec.origin_y
         ));
     } else {
         logging::debug(&format!("cannot apply input region yet ({label})"));
     }
+}
+
+/// Resize the layer surface to the card and place it with layer-shell margins.
+/// Only touches the compositor when something actually changed, because this
+/// runs on every drag update and every lyric line change.
+fn apply_layer_geometry(window: &gtk4::Window, area: &gtk4::DrawingArea, metrics: &SurfaceMetrics) {
+    if area.width_request() != metrics.width || area.height_request() != metrics.height {
+        area.set_size_request(metrics.width, metrics.height);
+        window.set_size_request(metrics.width, metrics.height);
+        window.set_default_size(metrics.width, metrics.height);
+        logging::debug(&format!(
+            "surface resized to {}x{}",
+            metrics.width, metrics.height
+        ));
+    }
+    window.set_margin(Edge::Left, metrics.left);
+    window.set_margin(Edge::Top, metrics.top);
+    logging::debug(&format!(
+        "surface at ({}, {}) draw offset ({}, {})",
+        metrics.left, metrics.top, metrics.draw_x, metrics.draw_y
+    ));
 }
 
 /// Apply one state mutation on the GTK thread and refresh the layer-surface
@@ -1143,12 +1230,17 @@ fn update_ui<R>(
     label: &str,
     update: impl FnOnce(&mut UiState) -> R,
 ) -> R {
-    let (result, spec) = {
+    let result = {
         let mut state = ui.borrow_mut();
-        let result = update(&mut state);
-        (result, state.input_region_spec())
+        update(&mut state)
     };
-    apply_input_region(window, &spec, label);
+    {
+        let state = ui.borrow();
+        if let Some(area) = &state.area {
+            apply_layer_geometry(window, area, &state.surface_metrics());
+        }
+        apply_input_region(window, &state.input_region_spec(), label);
+    }
     result
 }
 
@@ -1190,8 +1282,8 @@ fn update_hover(area: &gtk4::DrawingArea, ui: &Rc<RefCell<UiState>>, x: f64, y: 
         if state.pointer.is_moving() {
             false
         } else {
-            let local_x = x - f64::from(state.card_x());
-            let local_y = y - f64::from(state.card_y());
+            let local_x = x - f64::from(state.surface_metrics().draw_x);
+            let local_y = y - f64::from(state.surface_metrics().draw_y);
             let control = render::controls_hit(
                 &state.cfg.controls,
                 state.card_width,
@@ -1232,55 +1324,38 @@ fn build_window(
     ui: Rc<RefCell<UiState>>,
     cmd_tx: Sender<Command>,
 ) -> (gtk4::Window, gtk4::DrawingArea) {
-    let (monitor_w, monitor_h) = monitor
-        .map(|m| {
-            let g = m.geometry();
-            (g.width(), g.height())
-        })
-        .unwrap_or((1920, 1080));
+    let initial = ui.borrow().surface_metrics();
     let window = gtk4::Window::builder()
         .decorated(false)
         .resizable(false)
         .can_focus(false)
-        .default_width(monitor_w)
-        .default_height(monitor_h)
+        .default_width(initial.width)
+        .default_height(initial.height)
         .build();
     window.add_css_class("splayer-overlay");
 
     let area = gtk4::DrawingArea::new();
-    area.set_hexpand(true);
-    area.set_vexpand(true);
-    area.set_size_request(monitor_w, monitor_h);
+    // The surface is exactly the card, so it must not expand past its request.
+    area.set_hexpand(false);
+    area.set_vexpand(false);
+    area.set_size_request(initial.width, initial.height);
 
     let ui_draw = ui.clone();
-    let last_card = std::cell::Cell::new((-1, -1, -1));
-    area.set_draw_func(move |_area, cr, _width, _height| {
+    area.set_draw_func(move |_area, cr, width, height| {
         let state = ui_draw.borrow();
-        let card_x = state.card_x();
-        let card_y = state.card_y();
-        let card_w = state.card_width;
-        let card_h = state.cfg.height;
-        let old = last_card.get();
+        render::clear_rect(cr, 0, 0, width, height);
         if !state.card_visible() {
-            if old.0 >= 0 {
-                render::clear_rect(cr, old.0, old.1, old.2, card_h);
-            }
-            last_card.set((-1, -1, -1));
             return;
         }
-        if old.0 >= 0 && old != (card_x, card_y, card_w) {
-            render::clear_rect(cr, old.0, old.1, old.2, card_h);
-        }
-        render::clear_rect(cr, card_x, card_y, card_w, card_h);
-        last_card.set((card_x, card_y, card_w));
+        let metrics = state.surface_metrics();
         let scene = build_scene(&state);
         render::draw_overlay(
             cr,
             render::CardRect {
-                x: card_x,
-                y: card_y,
-                width: card_w,
-                height: card_h,
+                x: metrics.draw_x,
+                y: metrics.draw_y,
+                width: state.card_width,
+                height: state.cfg.height,
             },
             &scene,
             &state.cfg,
@@ -1298,6 +1373,8 @@ fn build_window(
     configure_layer(&window, "splayer-lyrics", monitor);
     window.set_anchor(Edge::Top, true);
     window.set_anchor(Edge::Left, true);
+    window.set_margin(Edge::Left, initial.left);
+    window.set_margin(Edge::Top, initial.top);
 
     let gesture = gtk4::GestureClick::new();
     gesture.set_button(1);
@@ -1305,12 +1382,13 @@ fn build_window(
     let ui_pressed = ui.clone();
     gesture.connect_pressed(move |_gesture, _n_press, x, y| {
         let mut state = ui_pressed.borrow_mut();
+        let metrics = state.surface_metrics();
         let target = render::press_target(
             &state.cfg.controls,
             state.card_width,
             state.cfg.height,
-            x - f64::from(state.card_x()),
-            y - f64::from(state.card_y()),
+            x - f64::from(metrics.draw_x),
+            y - f64::from(metrics.draw_y),
         );
         state.pointer.pressed(target);
     });
@@ -1382,25 +1460,38 @@ fn build_window(
     let ui_drag = ui.clone();
     drag.connect_drag_begin(move |_gesture, x, y| {
         let mut state = ui_drag.borrow_mut();
+        let metrics = state.surface_metrics();
         let target = render::press_target(
             &state.cfg.controls,
             state.card_width,
             state.cfg.height,
-            x - f64::from(state.card_x()),
-            y - f64::from(state.card_y()),
+            x - f64::from(metrics.draw_x),
+            y - f64::from(metrics.draw_y),
         );
         let (win_x, win_y) = (state.win_x, state.win_y);
         state.pointer.drag_begin(target, win_x, win_y);
+        // Widget coordinates are surface-local and the surface itself moves
+        // with the card, so remember the origin the offsets are relative to.
+        state.drag_press_origin = Some((metrics.left, metrics.top));
     });
 
     let ui_drag_update = ui.clone();
     let window_drag = window.clone();
     let area_drag = area.clone();
     drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
+        let (dx, dy) = {
+            let state = ui_drag_update.borrow();
+            let metrics = state.surface_metrics();
+            drag_monitor_delta(
+                state.drag_press_origin,
+                (metrics.left, metrics.top),
+                (offset_x, offset_y),
+            )
+        };
         let (region, became_moving) = {
             let mut state = ui_drag_update.borrow_mut();
             let was_moving = state.pointer.is_moving();
-            let effect = state.pointer.drag_update(offset_x, offset_y);
+            let effect = state.pointer.drag_update(dx, dy);
             let moving = state.pointer.is_moving();
             let region = match effect {
                 interaction::DragUpdate::Move { x, y } => {
@@ -1409,6 +1500,9 @@ fn build_window(
                     state.win_y = next_y;
                     // Persist even if the drag is cancelled before drag-end.
                     state.position_dirty = true;
+                    if let Some(area) = &state.area {
+                        apply_layer_geometry(&window_drag, area, &state.surface_metrics());
+                    }
                     state.redraw();
                     Some(state.input_region_spec())
                 }
@@ -1430,6 +1524,7 @@ fn build_window(
         let last_pointer = {
             let mut state = ui_drag_end.borrow_mut();
             let moved = state.pointer.drag_end();
+            state.drag_press_origin = None;
             let last_pointer = state.pointer_x.zip(state.pointer_y);
             // Width updates were deferred while the pointer was down.
             if state.update_card_width() {
@@ -1459,6 +1554,7 @@ fn build_window(
         let last_pointer = {
             let mut state = ui_drag_cancel.borrow_mut();
             state.pointer.cancel();
+            state.drag_press_origin = None;
             let last_pointer = state.pointer_x.zip(state.pointer_y);
             state.hover = None;
             state.hover_handle = false;
@@ -1510,15 +1606,19 @@ fn build_window(
 
     let region_ui = ui.clone();
     let region_window = window.clone();
+    let region_area = area.clone();
     window.connect_realize(move |_| {
-        let spec = region_ui.borrow().input_region_spec();
-        apply_input_region(&region_window, &spec, "realize");
+        let state = region_ui.borrow();
+        apply_layer_geometry(&region_window, &region_area, &state.surface_metrics());
+        apply_input_region(&region_window, &state.input_region_spec(), "realize");
     });
     let region_ui = ui.clone();
     let region_window = window.clone();
+    let region_area = area.clone();
     window.connect_map(move |_| {
-        let spec = region_ui.borrow().input_region_spec();
-        apply_input_region(&region_window, &spec, "map");
+        let state = region_ui.borrow();
+        apply_layer_geometry(&region_window, &region_area, &state.surface_metrics());
+        apply_input_region(&region_window, &state.input_region_spec(), "map");
     });
 
     (window, area)
@@ -2153,5 +2253,86 @@ mod tests {
             let right = next_win_x(WidthMode::Right, old_x, old_width, new_width);
             assert_eq!(left_edge(right, new_width), left_edge(old_x, old_width));
         }
+    }
+
+    fn test_state(win_x: i32, win_y: i32, width: i32) -> UiState {
+        let cfg = Config {
+            width,
+            height: 200,
+            ..Default::default()
+        };
+        let mut state = UiState::new(
+            cfg,
+            win_x,
+            win_y,
+            PathBuf::from("/tmp/splayer-test-position.json"),
+            2560,
+            1440,
+        );
+        state.card_width = width;
+        state.width_initialized = true;
+        state
+    }
+
+    #[test]
+    fn surface_metrics_cover_only_the_card() {
+        // Center of a 2560x1440 monitor, 100px above the bottom.
+        let state = test_state(1280, 100, 800);
+        let metrics = state.surface_metrics();
+        assert_eq!(
+            metrics,
+            SurfaceMetrics {
+                left: 880,
+                top: 1140,
+                width: 800,
+                height: 200,
+                draw_x: 0,
+                draw_y: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn surface_metrics_clip_at_screen_edges() {
+        // Card pushed past the left edge: surface starts at 0, card is offset.
+        let left = test_state(100, 100, 800).surface_metrics();
+        assert_eq!(left.left, 0);
+        assert_eq!(left.draw_x, -300);
+        assert_eq!(left.width, 500);
+
+        // Card pushed past the right edge: surface ends at the monitor edge.
+        let right = test_state(2560, 100, 800).surface_metrics();
+        assert_eq!(right.left, 2160);
+        assert_eq!(right.draw_x, 0);
+        assert_eq!(right.width, 400);
+    }
+
+    #[test]
+    fn drag_delta_accounts_for_the_moving_surface() {
+        // Press at surface origin (100, 50); the pointer moves 50 right.
+        let press = Some((100, 50));
+        assert_eq!(
+            drag_monitor_delta(press, (100, 50), (50.0, 0.0)),
+            (50.0, 0.0)
+        );
+
+        // After the surface followed the pointer the gesture offset resets to
+        // zero; the delta must still report the accumulated 50px.
+        assert_eq!(
+            drag_monitor_delta(press, (150, 50), (0.0, 0.0)),
+            (50.0, 0.0)
+        );
+
+        // One more pointer step adds to it instead of double counting.
+        assert_eq!(
+            drag_monitor_delta(press, (150, 50), (10.0, -5.0)),
+            (60.0, -5.0)
+        );
+
+        // Without a recorded press origin the offset is passed through.
+        assert_eq!(
+            drag_monitor_delta(None, (150, 50), (10.0, -5.0)),
+            (10.0, -5.0)
+        );
     }
 }

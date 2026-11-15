@@ -141,8 +141,8 @@ stderr。`start.sh` 会把 stderr 重定向到 `runtime/run.log`。
 - 按下后超过系统拖动阈值才进入拖动，因此拖动控制按钮不会误触播放/暂停。
 - 松开后位置保存到 `runtime/position.json`，下次启动恢复。
 - 卡片宽度会随歌词长度变化，但始终以保存的水平中心为锚点。
-- 拖动只改变卡片在固定全屏 surface 内的坐标，指针跟手，不会和合成器的窗口
-  移动反馈打架。
+- layer surface 与卡片同尺寸，拖动时通过 layer-shell `margin` 移动窗口；程序把
+  “surface 原点 + 本地坐标”换算成显示器坐标，避免窗口移动造成的反馈抖动。
 
 ### 卡片伸缩方向
 
@@ -320,8 +320,8 @@ niri validate
 - `supersample` 为 2.0 时文字更平滑，但换行瞬间 CPU 峰值更高；1.0–1.5 更省资源。
 - 想进一步降低 CPU：把 `fps` 调到 15，或关闭 `word_by_word`；降低视觉开销可以关闭
   `background` 或 `show_translation`。
-- 内存主要由 GTK/Pango 和全屏透明 surface 占据。`GSK_RENDERER=cairo` 和
-  `GTK_A11Y=none` 很重要，GL 渲染器大约会让 PSS 翻倍。
+- 内存主要由 GTK/Pango 和两个卡片大小的 Wayland 缓冲占据。`GSK_RENDERER=cairo`
+  和 `GTK_A11Y=none` 很重要，GL 渲染器大约会让 PSS 翻倍。
 - 托盘选择会写入 `runtime/ui.json`，之后改 `config.json` 里的字体/字号/颜色/
   宽度模式/翻译开关/歌词偏移不会覆盖已保存的托盘选择；删除 `runtime/ui.json`
   可恢复配置文件默认值。
@@ -359,8 +359,8 @@ flowchart LR
 - 没有歌词时显示“歌名 + 歌手”，拿到歌词后立即切换。
 - 整行歌词用 Pango 排版一次，按字节索引计算每个词的 x 范围；已播放部分通过
   裁剪矩形再画一遍同布局文字实现。
-- 创建一张覆盖整个输出的透明 layer-shell surface，卡片画在 surface 内部；拖动
-  只改变卡片坐标，surface 本身不移动。
+- layer-shell surface 与卡片同尺寸，用 `margin` 定位到卡片坐标；每帧只重绘卡片
+  本身，而不是整块显示器。
 - 输入区域只包含左下隐藏按钮、底部控制按钮和右下拖动手柄；歌词区域始终点击穿透。
 - 控件通过 `POST /api/prev`、`/api/play`、`/api/pause`、`/api/next` 控制播放，
   180 毫秒后重新同步状态。
@@ -368,8 +368,9 @@ flowchart LR
 
 ### 设计取舍
 
-- **固定全屏 surface，而不是移动小窗口**：拖动反馈稳定，全屏切换时不会出现
-  surface 被合成器移动导致的位置跳变；代价是内存和合成开销更高。
+- **卡片大小的 surface，而不是整屏 surface**：Wayland 双缓冲从约 29 MB 降到
+  1 MB 以内，每帧绘制面积减少约 90%；代价是拖动时需要把 surface-local 坐标
+  换算回显示器坐标。
 - **默认 cairo 渲染器**：比 GL 明显省内存；逐字歌词的绘制量不大，cairo 足够。
 - **2× 文字超采样**：每行只排版/缓存一次，换行时才有 CPU 峰值；比每帧高质量
   渲染更稳。
@@ -384,12 +385,13 @@ flowchart LR
 
 | 状态 | RSS | PSS | CPU（单核） |
 |---|---:|---:|---:|
-| 播放中、歌词可见 | 约 88–96 MB | 约 42–50 MB | 约 5–7% |
-| 播放器打开但暂停 | 约 88 MB | 约 42 MB | 约 0.4% |
-| SPlayer 关闭 / API 不可达（不绘制） | 约 62 MB | 约 22 MB | 约 0.2% |
+| 播放中、歌词可见 | 约 55–60 MB | 约 22–24 MB | 约 1.6–2.0% |
+| 播放器打开但暂停 | 约 55 MB | 约 22 MB | 约 0.4% |
+| SPlayer 关闭 / API 不可达（不绘制） | 约 50 MB | 约 20 MB | 约 0.2% |
 
-全屏透明 surface 和 2× 文字缓存是内存大头；换行瞬间有短时 CPU 峰值。把
-`supersample` 调到 1.5 可以明显降低 PSS，但文字边缘会稍微变软。
+卡片大小约 800×200 时，两个 Wayland 缓冲合计约 0.5 MB（整屏 surface 时要
+约 29 MB）。换行瞬间仍有短时 CPU 峰值，来自 2× 文字缓存的降采样；把
+`supersample` 调到 1.5 可以进一步降低这一峰值，但文字边缘会稍微变软。
 
 发布二进制约 7.4 MB（托盘引入 zbus）。以上数字只统计覆盖层进程，不含
 SPlayer-Next 本身。
