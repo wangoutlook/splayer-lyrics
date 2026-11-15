@@ -231,21 +231,10 @@ fn next_win_x(mode: WidthMode, old_win_x: i32, old_width: i32, new_width: i32) -
     }
 }
 
-/// `GestureDrag` reports offsets in surface-local coordinates, and the surface
-/// moves with the card. Add the origin shift so the caller gets a stable
-/// monitor-space delta (used by [`interaction::PointerState::drag_update`]).
-fn drag_monitor_delta(
-    press_origin: Option<(i32, i32)>,
-    current_origin: (i32, i32),
-    offset: (f64, f64),
-) -> (f64, f64) {
-    match press_origin {
-        Some((press_x, press_y)) => (
-            offset.0 + f64::from(current_origin.0 - press_x),
-            offset.1 + f64::from(current_origin.1 - press_y),
-        ),
-        None => offset,
-    }
+/// Drag deltas are measured from the gesture offset captured once the expanded
+/// surface is in effect, so a stale surface position can never leak in.
+fn drag_delta(anchor: (f64, f64), offset: (f64, f64)) -> (f64, f64) {
+    (offset.0 - anchor.0, offset.1 - anchor.1)
 }
 
 fn set_config_output(path: &Path, output: &str) -> anyhow::Result<()> {
@@ -384,10 +373,14 @@ struct UiState {
     hover_hide: bool,
     pointer_x: Option<f64>,
     pointer_y: Option<f64>,
-    /// Surface origin (layer-shell margin) at drag start. `GestureDrag` offsets
-    /// are surface-local and the surface itself moves with the card, so the
-    /// monitor-space delta is `offset + (origin_now - origin_at_press)`.
-    drag_press_origin: Option<(i32, i32)>,
+    /// While dragging, the surface is expanded to the whole monitor and kept
+    /// still. Layer-shell margins are applied asynchronously by the compositor,
+    /// so moving the surface during the drag feeds stale widget coordinates
+    /// back into the delta and the card runs away from the pointer.
+    drag_fullscreen: bool,
+    /// Gesture offset captured once the expanded surface is in effect. Drag
+    /// deltas are measured from here.
+    drag_anchor: Option<(f64, f64)>,
     last_width_fingerprint: Option<u64>,
     win_x: i32,
     win_y: i32,
@@ -441,7 +434,8 @@ impl UiState {
             hover_hide: false,
             pointer_x: None,
             pointer_y: None,
-            drag_press_origin: None,
+            drag_fullscreen: false,
+            drag_anchor: None,
             last_width_fingerprint: None,
             win_x,
             win_y,
@@ -509,7 +503,21 @@ impl UiState {
     /// The layer surface only covers the card, so every frame repaints a small
     /// area instead of the whole monitor. A card pushed past a screen edge is
     /// clipped by shrinking the surface and offsetting the drawing inside it.
+    ///
+    /// While dragging the surface is expanded to the whole monitor and stays
+    /// put: moving it would depend on layer-shell margins, which the compositor
+    /// applies asynchronously.
     fn surface_metrics(&self) -> SurfaceMetrics {
+        if self.drag_fullscreen {
+            return SurfaceMetrics {
+                left: 0,
+                top: 0,
+                width: self.monitor_w.max(1),
+                height: self.monitor_h.max(1),
+                draw_x: self.card_x(),
+                draw_y: self.card_y(),
+            };
+        }
         let card_x = self.card_x();
         let card_w = self.card_width.max(1);
         let monitor_w = self.monitor_w.max(1);
@@ -550,10 +558,6 @@ impl UiState {
             origin_y: metrics.draw_y,
             visible: self.card_visible(),
         }
-    }
-
-    fn refresh_input_region(&self, label: &str) {
-        self.sync_surface(label);
     }
 
     /// Returns whether the measured width changed, so the tick loop can
@@ -1182,8 +1186,8 @@ fn apply_input_region(window: &gtk4::Window, spec: &InputRegionSpec, label: &str
             logging::debug(&format!("input region {label}: empty (card hidden)"));
             return;
         }
-        let rects = render::input_region_rects(&spec.controls, spec.card_width, spec.card_height);
         let region = cairo::Region::create();
+        let rects = render::input_region_rects(&spec.controls, spec.card_width, spec.card_height);
         for (x, y, w, h) in &rects {
             let rect = cairo::RectangleInt::new(x + spec.origin_x, y + spec.origin_y, *w, *h);
             let _ = region.union_rectangle(&rect);
@@ -1470,43 +1474,64 @@ fn build_window(
         );
         let (win_x, win_y) = (state.win_x, state.win_y);
         state.pointer.drag_begin(target, win_x, win_y);
-        // Widget coordinates are surface-local and the surface itself moves
-        // with the card, so remember the origin the offsets are relative to.
-        state.drag_press_origin = Some((metrics.left, metrics.top));
+        state.drag_fullscreen = false;
+        state.drag_anchor = None;
+        logging::debug(&format!(
+            "drag begin local=({x:.0},{y:.0}) origin=({},{}) win=({win_x},{win_y}) target={target:?}",
+            metrics.left, metrics.top
+        ));
     });
 
     let ui_drag_update = ui.clone();
     let window_drag = window.clone();
     let area_drag = area.clone();
     drag.connect_drag_update(move |_gesture, offset_x, offset_y| {
-        let (dx, dy) = {
-            let state = ui_drag_update.borrow();
-            let metrics = state.surface_metrics();
-            drag_monitor_delta(
-                state.drag_press_origin,
-                (metrics.left, metrics.top),
-                (offset_x, offset_y),
-            )
-        };
         let (region, became_moving) = {
             let mut state = ui_drag_update.borrow_mut();
             let was_moving = state.pointer.is_moving();
+
+            let (dx, dy) = match state.drag_anchor {
+                Some(anchor) => drag_delta(anchor, (offset_x, offset_y)),
+                // Before the anchor exists only the threshold matters.
+                None => (offset_x, offset_y),
+            };
+            let anchored = state.drag_anchor.is_some();
             let effect = state.pointer.drag_update(dx, dy);
+
+            // Expand on the first real move (a blocked hide-button drag or a
+            // sub-threshold press must not resize the surface).
+            if !state.drag_fullscreen && matches!(effect, interaction::DragUpdate::Move { .. }) {
+                state.drag_fullscreen = true;
+                state.drag_anchor = None;
+                state.sync_surface("drag-expand");
+            }
+
+            // Wait until the expanded surface is actually allocated, then
+            // anchor the gesture there: from now on widget coordinates are
+            // monitor coordinates and the surface never moves again.
+            if state.drag_fullscreen && state.drag_anchor.is_none() {
+                let expanded = state
+                    .area
+                    .as_ref()
+                    .map(|area| area.width() >= state.monitor_w && area.height() >= state.monitor_h)
+                    .unwrap_or(false);
+                if expanded {
+                    state.drag_anchor = Some((offset_x, offset_y));
+                }
+            }
+
             let moving = state.pointer.is_moving();
             let region = match effect {
-                interaction::DragUpdate::Move { x, y } => {
+                interaction::DragUpdate::Move { x, y } if anchored => {
                     let (next_x, next_y) = state.clamped_position(x, y);
                     state.win_x = next_x;
                     state.win_y = next_y;
                     // Persist even if the drag is cancelled before drag-end.
                     state.position_dirty = true;
-                    if let Some(area) = &state.area {
-                        apply_layer_geometry(&window_drag, area, &state.surface_metrics());
-                    }
                     state.redraw();
                     Some(state.input_region_spec())
                 }
-                interaction::DragUpdate::Ignored | interaction::DragUpdate::Blocked => None,
+                _ => None,
             };
             (region, !was_moving && moving)
         };
@@ -1524,12 +1549,12 @@ fn build_window(
         let last_pointer = {
             let mut state = ui_drag_end.borrow_mut();
             let moved = state.pointer.drag_end();
-            state.drag_press_origin = None;
+            state.drag_fullscreen = false;
+            state.drag_anchor = None;
             let last_pointer = state.pointer_x.zip(state.pointer_y);
             // Width updates were deferred while the pointer was down.
-            if state.update_card_width() {
-                state.refresh_input_region("drag-end");
-            }
+            state.update_card_width();
+            state.sync_surface("drag-end");
             if moved {
                 state.save_position();
                 logging::info(&format!(
@@ -1554,14 +1579,14 @@ fn build_window(
         let last_pointer = {
             let mut state = ui_drag_cancel.borrow_mut();
             state.pointer.cancel();
-            state.drag_press_origin = None;
+            state.drag_fullscreen = false;
+            state.drag_anchor = None;
             let last_pointer = state.pointer_x.zip(state.pointer_y);
             state.hover = None;
             state.hover_handle = false;
             state.hover_hide = false;
-            if state.update_card_width() {
-                state.refresh_input_region("drag-cancel");
-            }
+            state.update_card_width();
+            state.sync_surface("drag-cancel");
             state.redraw();
             last_pointer
         };
@@ -1673,7 +1698,7 @@ fn start_tick(ui: &Rc<RefCell<UiState>>, tick: &TickCell) {
             if line_changed {
                 state.last_line = index;
                 if state.update_card_width() {
-                    state.refresh_input_region("tick");
+                    state.sync_surface("tick");
                 }
             }
             (state.playing, state.area.clone())
@@ -2308,31 +2333,12 @@ mod tests {
     }
 
     #[test]
-    fn drag_delta_accounts_for_the_moving_surface() {
-        // Press at surface origin (100, 50); the pointer moves 50 right.
-        let press = Some((100, 50));
-        assert_eq!(
-            drag_monitor_delta(press, (100, 50), (50.0, 0.0)),
-            (50.0, 0.0)
-        );
-
-        // After the surface followed the pointer the gesture offset resets to
-        // zero; the delta must still report the accumulated 50px.
-        assert_eq!(
-            drag_monitor_delta(press, (150, 50), (0.0, 0.0)),
-            (50.0, 0.0)
-        );
-
-        // One more pointer step adds to it instead of double counting.
-        assert_eq!(
-            drag_monitor_delta(press, (150, 50), (10.0, -5.0)),
-            (60.0, -5.0)
-        );
-
-        // Without a recorded press origin the offset is passed through.
-        assert_eq!(
-            drag_monitor_delta(None, (150, 50), (10.0, -5.0)),
-            (10.0, -5.0)
-        );
+    fn drag_delta_is_measured_from_the_anchor() {
+        // The surface is expanded and static while dragging, so the delta is
+        // purely the gesture offset since the anchor was taken.
+        assert_eq!(drag_delta((20.0, 10.0), (20.0, 10.0)), (0.0, 0.0));
+        assert_eq!(drag_delta((20.0, 10.0), (95.0, -5.0)), (75.0, -15.0));
+        // Moving back towards the anchor shrinks the delta again.
+        assert_eq!(drag_delta((20.0, 10.0), (0.0, 10.0)), (-20.0, 0.0));
     }
 }

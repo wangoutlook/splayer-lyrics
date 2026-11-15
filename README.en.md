@@ -145,9 +145,12 @@ You can also run the binary directly:
 - The position is saved to `runtime/position.json` on release.
 - The card width follows the current lyric line, anchored at the saved
   horizontal center.
-- The layer surface is the size of the card; dragging moves it with layer-shell
-  margins, converting "surface origin + local coordinates" back to monitor space
-  so the moving window cannot fight the pointer.
+- The layer surface normally matches the card. A drag expands it to the whole
+  output and keeps it still, so the card moves inside a fixed canvas; it shrinks
+  back on release.
+- A moving small window is not used: layer-shell margins are applied
+  asynchronously, so widget coordinates lag behind the position we just set and
+  the delta feeds back into itself.
 
 ### Width growth direction
 
@@ -394,8 +397,11 @@ flowchart LR
 ### Design trade-offs
 
 - **Card-sized surface instead of a full-output one**: Wayland double buffering
-  drops from ~29 MB to under 1 MB and each frame paints ~90% fewer pixels; the
-  trade-off is converting surface-local drag coordinates back to monitor space.
+  drops from ~29 MB to under 1 MB and each frame paints ~90% fewer pixels. The
+  surface is expanded to the full output only while dragging.
+- **Fixed canvas while dragging**: layer-shell margins take effect
+  asynchronously, so deriving deltas from a moving window amplifies itself.
+  Expanding instead keeps pointer and card strictly 1:1.
 - **Cairo by default**: much less memory than GL; the drawing load is small.
 - **2× supersampled text**: laid out and cached once per line, so CPU spikes
   only on line changes.
