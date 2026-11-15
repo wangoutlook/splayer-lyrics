@@ -142,20 +142,24 @@ You can also run the binary directly:
 
 - Drag the centered prev / play-pause / next buttons, or the six-dot handle at
   the bottom-right.
+- Buttons still wait for the drag threshold so a click stays a click; the handle
+  and padding start dragging on press.
 - The position is saved to `runtime/position.json` on release.
 - The card width follows the current lyric line, anchored at the saved
   horizontal center.
-- The layer surface normally matches the card. A drag expands it to the whole
-  output and keeps it still, so the card moves inside a fixed canvas; it shrinks
-  back on release.
-- Buttons still wait for the drag threshold so a click stays a click. The drag
-  handle and the padding expand at press time.
-- Drag offsets are measured from the press. Movement that happens while the
-  expansion is pending is kept, so the card catches the pointer without a dead
-  zone once the canvas is ready.
+- Pointer input is received by a permanent, transparent full-output layer
+  surface; the card surface only draws. A drag moves just the card's layer-shell
+  margins, while gesture coordinates always come from the stationary input
+  surface.
+- With input and drawing split, a drag never resizes or rebuilds a buffer: no
+  corner flash and no card blink while an allocation lands. Pointer and card
+  stay strictly 1:1.
+- The cost is one permanent transparent full-output input surface, double
+  buffered (about 30 MB of `gdk-wayland`, PSS +~15 MB); idle CPU stays below 1%.
 - A moving small window is not used: layer-shell margins are applied
   asynchronously, so widget coordinates lag behind the position we just set and
-  the delta feeds back into itself.
+  the delta feeds back into itself. Keeping input on a surface that never moves
+  removes that feedback loop.
 
 ### Width growth direction
 
@@ -401,14 +405,13 @@ flowchart LR
 
 ### Design trade-offs
 
-- **Card-sized surface instead of a full-output one**: Wayland double buffering
-  drops from ~29 MB to under 1 MB and each frame paints ~90% fewer pixels. The
-  surface is expanded to the full output only while dragging.
-- **Fixed canvas while dragging**: layer-shell margins take effect
-  asynchronously, so deriving deltas from a moving window amplifies itself.
-  Expanding instead keeps pointer and card strictly 1:1. The handle and padding
-  expand at press and measure from the press, at the cost of briefly allocating
-  a full-output buffer on a handle click.
+- **Card-sized drawing surface**: Wayland double buffering drops from ~29 MB to
+  under 1 MB and each frame paints ~90% fewer pixels.
+- **Separate permanent input surface**: a transparent full-output surface only
+  receives the pointer; the card surface moves with layer-shell margins.
+  Gesture coordinates are unaffected by the asynchronous margins, so pointer and
+  card stay strictly 1:1 without any expansion flash or blank frame. The cost is
+  a resident full-output input surface (double buffered, PSS +~15 MB).
 - **Cairo by default**: much less memory than GL; the drawing load is small.
 - **2× supersampled text**: laid out and cached once per line, so CPU spikes
   only on line changes.
