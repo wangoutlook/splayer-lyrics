@@ -378,9 +378,15 @@ struct UiState {
     /// so moving the surface during the drag feeds stale widget coordinates
     /// back into the delta and the card runs away from the pointer.
     drag_fullscreen: bool,
-    /// Gesture offset captured once the expanded surface is in effect. Drag
-    /// deltas are measured from here.
+    /// Whether the compositor has actually granted the full-monitor allocation.
+    /// Until then the card keeps drawing into the old small surface, so a
+    /// pending expansion can never paint the card at monitor coordinates.
+    drag_expanded: bool,
+    /// Gesture offset captured at press. Drag deltas are measured from here, so
+    /// none of the movement that happens while the surface expands is lost.
     drag_anchor: Option<(f64, f64)>,
+    /// Most recent gesture offset, replayed after a pending expansion lands.
+    drag_last_offset: (f64, f64),
     last_width_fingerprint: Option<u64>,
     win_x: i32,
     win_y: i32,
@@ -435,7 +441,9 @@ impl UiState {
             pointer_x: None,
             pointer_y: None,
             drag_fullscreen: false,
+            drag_expanded: false,
             drag_anchor: None,
+            drag_last_offset: (0.0, 0.0),
             last_width_fingerprint: None,
             win_x,
             win_y,
@@ -508,15 +516,8 @@ impl UiState {
     /// put: moving it would depend on layer-shell margins, which the compositor
     /// applies asynchronously.
     fn surface_metrics(&self) -> SurfaceMetrics {
-        if self.drag_fullscreen {
-            return SurfaceMetrics {
-                left: 0,
-                top: 0,
-                width: self.monitor_w.max(1),
-                height: self.monitor_h.max(1),
-                draw_x: self.card_x(),
-                draw_y: self.card_y(),
-            };
+        if self.drag_fullscreen && self.drag_expanded {
+            return self.fullscreen_metrics();
         }
         let card_x = self.card_x();
         let card_w = self.card_width.max(1);
@@ -533,13 +534,41 @@ impl UiState {
         }
     }
 
+    fn fullscreen_metrics(&self) -> SurfaceMetrics {
+        SurfaceMetrics {
+            left: 0,
+            top: 0,
+            width: self.monitor_w.max(1),
+            height: self.monitor_h.max(1),
+            draw_x: self.card_x(),
+            draw_y: self.card_y(),
+        }
+    }
+
+    /// Geometry to request from the compositor. Differs from
+    /// [`Self::surface_metrics`] only while the expansion is pending, when the
+    /// surface has been asked to grow but the old allocation is still current.
+    fn layer_metrics(&self) -> SurfaceMetrics {
+        if self.drag_fullscreen {
+            return self.fullscreen_metrics();
+        }
+        self.surface_metrics()
+    }
+
+    fn drag_area_expanded(&self) -> bool {
+        self.area
+            .as_ref()
+            .map(|area| area.width() >= self.monitor_w && area.height() >= self.monitor_h)
+            .unwrap_or(false)
+    }
+
     /// Push the card geometry to the layer surface. Called after any change to
     /// width, position, or monitor size.
     fn sync_surface(&self, label: &str) {
         let (Some(window), Some(area)) = (&self.window, &self.area) else {
             return;
         };
-        let metrics = self.surface_metrics();
+        let metrics = self.layer_metrics();
         apply_layer_geometry(window, area, &metrics);
         apply_input_region(window, &self.input_region_spec(), label);
     }
@@ -613,6 +642,57 @@ impl UiState {
                 self.width_initialized = true;
             }
             false
+        }
+    }
+
+    /// Record a press. Drag-only areas (handle and padding) expand the canvas
+    /// immediately so the card follows the very first pixel; buttons wait for
+    /// the normal drag threshold so a click is never mistaken for a move.
+    fn begin_drag(&mut self, target: Option<render::PressTarget>) {
+        let (win_x, win_y) = (self.win_x, self.win_y);
+        self.pointer.drag_begin(target, win_x, win_y);
+        self.drag_last_offset = (0.0, 0.0);
+        let immediate = matches!(
+            target,
+            Some(render::PressTarget::Handle | render::PressTarget::Pad)
+        );
+        self.drag_fullscreen = immediate;
+        self.drag_expanded = false;
+        // Offsets are always measured from the press, so movement during the
+        // asynchronous expansion is kept instead of becoming a dead zone.
+        self.drag_anchor = immediate.then_some((0.0, 0.0));
+        if immediate {
+            self.sync_surface("drag-expand");
+        }
+    }
+
+    /// Apply a gesture delta measured from the press. Returns the new input
+    /// region once the card actually moved.
+    fn apply_drag(&mut self, dx: f64, dy: f64) -> Option<InputRegionSpec> {
+        self.drag_last_offset = (dx, dy);
+        let effect = self.pointer.drag_update(dx, dy);
+
+        if !self.drag_fullscreen && matches!(effect, interaction::DragUpdate::Move { .. }) {
+            self.drag_fullscreen = true;
+            self.drag_expanded = false;
+            self.drag_anchor = Some((0.0, 0.0));
+            self.sync_surface("drag-expand");
+        }
+        if self.drag_fullscreen && !self.drag_expanded && self.drag_area_expanded() {
+            self.drag_expanded = true;
+        }
+
+        match effect {
+            interaction::DragUpdate::Move { x, y } if self.drag_expanded => {
+                let (next_x, next_y) = self.clamped_position(x, y);
+                self.win_x = next_x;
+                self.win_y = next_y;
+                // Persist even if the drag is cancelled before drag-end.
+                self.position_dirty = true;
+                self.redraw();
+                Some(self.input_region_spec())
+            }
+            _ => None,
         }
     }
 
@@ -1241,7 +1321,7 @@ fn update_ui<R>(
     {
         let state = ui.borrow();
         if let Some(area) = &state.area {
-            apply_layer_geometry(window, area, &state.surface_metrics());
+            apply_layer_geometry(window, area, &state.layer_metrics());
         }
         apply_input_region(window, &state.input_region_spec(), label);
     }
@@ -1273,6 +1353,43 @@ fn refresh_cursor_for(ui: &Rc<RefCell<UiState>>) {
     if let Some(area) = area {
         refresh_cursor(&area, ui);
     }
+}
+
+/// The compositor grants the full-monitor allocation asynchronously. Poll
+/// briefly while a press is active so the card starts moving as soon as it
+/// lands, even if the pointer is held still and no further gesture updates
+/// arrive. Stops when the expansion is granted or the press ends.
+fn schedule_drag_promote(ui: Rc<RefCell<UiState>>, window: gtk4::Window, area: gtk4::DrawingArea) {
+    glib::timeout_add_local(Duration::from_millis(4), move || {
+        let (region, became_moving, done) = {
+            let mut state = ui.borrow_mut();
+            if !state.pointer.is_armed() {
+                return glib::ControlFlow::Break;
+            }
+            if !state.drag_fullscreen || state.drag_expanded {
+                return glib::ControlFlow::Continue;
+            }
+            let was_moving = state.pointer.is_moving();
+            let (dx, dy) = state.drag_last_offset;
+            let region = state.apply_drag(dx, dy);
+            (
+                region,
+                !was_moving && state.pointer.is_moving(),
+                state.drag_expanded,
+            )
+        };
+        if let Some(spec) = region {
+            apply_input_region(&window, &spec, "drag-promote");
+        }
+        if became_moving {
+            refresh_cursor(&area, &ui);
+        }
+        if done {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
 }
 
 /// Store the pointer position and recompute hover from the current card
@@ -1462,24 +1579,28 @@ fn build_window(
     drag.set_button(1);
 
     let ui_drag = ui.clone();
+    let area_drag_begin = area.clone();
+    let window_drag_begin = window.clone();
     drag.connect_drag_begin(move |_gesture, x, y| {
-        let mut state = ui_drag.borrow_mut();
-        let metrics = state.surface_metrics();
-        let target = render::press_target(
-            &state.cfg.controls,
-            state.card_width,
-            state.cfg.height,
-            x - f64::from(metrics.draw_x),
-            y - f64::from(metrics.draw_y),
-        );
-        let (win_x, win_y) = (state.win_x, state.win_y);
-        state.pointer.drag_begin(target, win_x, win_y);
-        state.drag_fullscreen = false;
-        state.drag_anchor = None;
-        logging::debug(&format!(
-            "drag begin local=({x:.0},{y:.0}) origin=({},{}) win=({win_x},{win_y}) target={target:?}",
-            metrics.left, metrics.top
-        ));
+        let message = {
+            let mut state = ui_drag.borrow_mut();
+            let metrics = state.surface_metrics();
+            let target = render::press_target(
+                &state.cfg.controls,
+                state.card_width,
+                state.cfg.height,
+                x - f64::from(metrics.draw_x),
+                y - f64::from(metrics.draw_y),
+            );
+            let (win_x, win_y) = (state.win_x, state.win_y);
+            state.begin_drag(target);
+            format!(
+                "drag begin local=({x:.0},{y:.0}) origin=({},{}) win=({win_x},{win_y}) target={target:?}",
+                metrics.left, metrics.top
+            )
+        };
+        logging::debug(&message);
+        schedule_drag_promote(ui_drag.clone(), window_drag_begin.clone(), area_drag_begin.clone());
     });
 
     let ui_drag_update = ui.clone();
@@ -1489,51 +1610,13 @@ fn build_window(
         let (region, became_moving) = {
             let mut state = ui_drag_update.borrow_mut();
             let was_moving = state.pointer.is_moving();
-
             let (dx, dy) = match state.drag_anchor {
                 Some(anchor) => drag_delta(anchor, (offset_x, offset_y)),
                 // Before the anchor exists only the threshold matters.
                 None => (offset_x, offset_y),
             };
-            let anchored = state.drag_anchor.is_some();
-            let effect = state.pointer.drag_update(dx, dy);
-
-            // Expand on the first real move (a blocked hide-button drag or a
-            // sub-threshold press must not resize the surface).
-            if !state.drag_fullscreen && matches!(effect, interaction::DragUpdate::Move { .. }) {
-                state.drag_fullscreen = true;
-                state.drag_anchor = None;
-                state.sync_surface("drag-expand");
-            }
-
-            // Wait until the expanded surface is actually allocated, then
-            // anchor the gesture there: from now on widget coordinates are
-            // monitor coordinates and the surface never moves again.
-            if state.drag_fullscreen && state.drag_anchor.is_none() {
-                let expanded = state
-                    .area
-                    .as_ref()
-                    .map(|area| area.width() >= state.monitor_w && area.height() >= state.monitor_h)
-                    .unwrap_or(false);
-                if expanded {
-                    state.drag_anchor = Some((offset_x, offset_y));
-                }
-            }
-
-            let moving = state.pointer.is_moving();
-            let region = match effect {
-                interaction::DragUpdate::Move { x, y } if anchored => {
-                    let (next_x, next_y) = state.clamped_position(x, y);
-                    state.win_x = next_x;
-                    state.win_y = next_y;
-                    // Persist even if the drag is cancelled before drag-end.
-                    state.position_dirty = true;
-                    state.redraw();
-                    Some(state.input_region_spec())
-                }
-                _ => None,
-            };
-            (region, !was_moving && moving)
+            let region = state.apply_drag(dx, dy);
+            (region, !was_moving && state.pointer.is_moving())
         };
         if became_moving {
             refresh_cursor(&area_drag, &ui_drag_update);
@@ -1550,7 +1633,9 @@ fn build_window(
             let mut state = ui_drag_end.borrow_mut();
             let moved = state.pointer.drag_end();
             state.drag_fullscreen = false;
+            state.drag_expanded = false;
             state.drag_anchor = None;
+            state.drag_last_offset = (0.0, 0.0);
             let last_pointer = state.pointer_x.zip(state.pointer_y);
             // Width updates were deferred while the pointer was down.
             state.update_card_width();
@@ -1580,7 +1665,9 @@ fn build_window(
             let mut state = ui_drag_cancel.borrow_mut();
             state.pointer.cancel();
             state.drag_fullscreen = false;
+            state.drag_expanded = false;
             state.drag_anchor = None;
+            state.drag_last_offset = (0.0, 0.0);
             let last_pointer = state.pointer_x.zip(state.pointer_y);
             state.hover = None;
             state.hover_handle = false;
@@ -1634,7 +1721,7 @@ fn build_window(
     let region_area = area.clone();
     window.connect_realize(move |_| {
         let state = region_ui.borrow();
-        apply_layer_geometry(&region_window, &region_area, &state.surface_metrics());
+        apply_layer_geometry(&region_window, &region_area, &state.layer_metrics());
         apply_input_region(&region_window, &state.input_region_spec(), "realize");
     });
     let region_ui = ui.clone();
@@ -1642,7 +1729,7 @@ fn build_window(
     let region_area = area.clone();
     window.connect_map(move |_| {
         let state = region_ui.borrow();
-        apply_layer_geometry(&region_window, &region_area, &state.surface_metrics());
+        apply_layer_geometry(&region_window, &region_area, &state.layer_metrics());
         apply_input_region(&region_window, &state.input_region_spec(), "map");
     });
 

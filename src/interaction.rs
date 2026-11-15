@@ -90,8 +90,17 @@ impl PointerState {
             return DragUpdate::Ignored;
         };
 
+        // The handle and the padding are drag-only, so there is no click to
+        // protect and the card should start following the pointer at once.
+        // Buttons keep the larger threshold so a click stays a click.
+        let threshold = if matches!(drag.origin, PressTarget::Handle | PressTarget::Pad) {
+            1.0
+        } else {
+            self.threshold
+        };
+
         if !drag.active {
-            if dx.abs().max(dy.abs()) < self.threshold {
+            if dx.abs().max(dy.abs()) < threshold {
                 return DragUpdate::Ignored;
             }
             drag.active = true;
@@ -268,10 +277,26 @@ mod tests {
 
     #[test]
     fn threshold_is_per_axis() {
-        let mut pointer = armed(PressTarget::Handle);
+        let mut pointer = armed(PressTarget::PlayPause);
         assert_eq!(pointer.drag_update(7.0, 7.0), DragUpdate::Ignored);
         assert!(matches!(
             pointer.drag_update(8.0, 0.0),
+            DragUpdate::Move { .. }
+        ));
+    }
+
+    #[test]
+    fn drag_only_targets_ignore_the_click_threshold() {
+        let mut pointer = armed(PressTarget::Handle);
+        assert_eq!(pointer.drag_update(0.5, 0.0), DragUpdate::Ignored);
+        assert_eq!(
+            pointer.drag_update(1.0, 0.0),
+            DragUpdate::Move { x: 1001, y: 60 }
+        );
+
+        let mut pointer = armed(PressTarget::Pad);
+        assert!(matches!(
+            pointer.drag_update(0.0, -1.0),
             DragUpdate::Move { .. }
         ));
     }

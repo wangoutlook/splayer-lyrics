@@ -148,6 +148,11 @@ You can also run the binary directly:
 - The layer surface normally matches the card. A drag expands it to the whole
   output and keeps it still, so the card moves inside a fixed canvas; it shrinks
   back on release.
+- Buttons still wait for the drag threshold so a click stays a click. The drag
+  handle and the padding expand at press time.
+- Drag offsets are measured from the press. Movement that happens while the
+  expansion is pending is kept, so the card catches the pointer without a dead
+  zone once the canvas is ready.
 - A moving small window is not used: layer-shell margins are applied
   asynchronously, so widget coordinates lag behind the position we just set and
   the delta feeds back into itself.
@@ -401,7 +406,9 @@ flowchart LR
   surface is expanded to the full output only while dragging.
 - **Fixed canvas while dragging**: layer-shell margins take effect
   asynchronously, so deriving deltas from a moving window amplifies itself.
-  Expanding instead keeps pointer and card strictly 1:1.
+  Expanding instead keeps pointer and card strictly 1:1. The handle and padding
+  expand at press and measure from the press, at the cost of briefly allocating
+  a full-output buffer on a handle click.
 - **Cairo by default**: much less memory than GL; the drawing load is small.
 - **2× supersampled text**: laid out and cached once per line, so CPU spikes
   only on line changes.
