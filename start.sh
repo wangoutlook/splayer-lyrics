@@ -7,8 +7,15 @@ PIDFILE="runtime/pid"
 if [[ -f "$PIDFILE" ]]; then
     old_pid="$(cat "$PIDFILE" 2>/dev/null || true)"
     if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-        echo "splayer-lyrics is already running (pid $old_pid)"
-        exit 1
+        # PID 会被复用：开机早期 2187 很可能是别的进程。
+        # 必须确认它真的是 splayer-lyrics，否则误判为“已在运行”而拒绝启动。
+        old_comm="$(cat "/proc/$old_pid/comm" 2>/dev/null || true)"
+        old_cmdline="$(tr '\0' ' ' <"/proc/$old_pid/cmdline" 2>/dev/null || true)"
+        if [[ "$old_comm" == "splayer-lyrics" || "$old_cmdline" == *"target/release/splayer-lyrics"* ]]; then
+            echo "splayer-lyrics is already running (pid $old_pid)"
+            exit 1
+        fi
+        echo "pid $old_pid is alive but not splayer-lyrics (comm=$old_comm); treating pid file as stale" >&2
     fi
     rm -f "$PIDFILE"
 fi
